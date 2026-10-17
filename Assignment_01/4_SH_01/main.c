@@ -1,1388 +1,1341 @@
 /* myshell - a custom UNIX-like shell (CSE-3110 OS Lab, Assignment 1)
- * The folder where myshell is started becomes its root "/" (pwd and the prompt show it by its name).
- * No command (cd, ls, cat, cp, mv, rm, redirection, ...) can reach a path above it. */
-#include<stdio.h>
-#include<stdlib.h>
-#include<string.h>
-#include<ctype.h>
-#include<errno.h>
-#include<limits.h>
-#include<signal.h>
-#include<time.h>
-#include<unistd.h>
-#include<fcntl.h>
-#include<dirent.h>
-#include<pwd.h>
-#include<sys/types.h>
-#include<sys/stat.h>
-#include<sys/wait.h>
-#include<sys/utsname.h>
-#define MAX_LINE 1024
-#define MAX_ARGS 64
-#define MAX_CMDS 16
-#define MAX_TOKENS 256
-#define MAX_JOBS 64
-#define BUF_SIZE 4096
-#define HIST_SIZE 100
-#define WORD_BUF 16384
+ * Every command is written with the POSIX system calls named in the assignment. */
+#include<stdio.h>                   //printf, fprintf, fgets, perror, snprintf
+#include<stdlib.h>                  //malloc, realloc, free, exit, getenv, strtol, qsort
+#include<string.h>                  //strcmp, strlen, strchr, strerror, strdup, memset
+#include<ctype.h>                   //isalpha, isalnum, isdigit for variable names and !N
+#include<errno.h>                   //errno and error codes (ENOENT, EISDIR, EINTR ...)
+#include<limits.h>                  //PATH_MAX, the longest path we store
+#include<signal.h>                  //sigaction, signal, SIGINT for Ctrl+C handling
+#include<time.h>                    //localtime, strftime for the ls -l date
+#include<unistd.h>                  //fork, execvp, pipe, dup2, read, write, close, chdir, getcwd, unlink, rmdir
+#include<fcntl.h>                   //open flags O_RDONLY, O_CREAT, O_TRUNC, O_APPEND, AT_FDCWD
+#include<dirent.h>                  //opendir, readdir, closedir for ls and rm -r
+#include<pwd.h>                     //getpwuid: user name from a user id
+#include<sys/types.h>               //pid_t, mode_t, ssize_t types
+#include<sys/stat.h>                //stat, mkdir, utimensat, S_ISDIR
+#include<sys/wait.h>                //waitpid and WIFEXITED / WEXITSTATUS macros
+#include<sys/utsname.h>             //uname and struct utsname
+#define MAX_LINE 1024               //longest input line (including newline and '\0')
+#define MAX_ARGS 64                 //most words in one command (+1 slot for the NULL end)
+#define MAX_CMDS 16                 //most commands joined by pipes in one line
+#define MAX_TOKENS 256              //most tokens (words + operators) in one line
+#define MAX_JOBS 64                 //most background jobs remembered at once
+#define BUF_SIZE 4096               //block size for read()/write() copying
+#define HIST_SIZE 100               //how many history entries are kept in memory
+#define MAX_REDIR 16                //most < > >> redirections on one command
+#define WORD_BUF 16384              //space for all words of one parsed line
+#define SAVED_IN 100        //spare fds that keep stdin/stdout while a builtin is redirected
+#define SAVED_OUT 101               //spare fd for the saved stdout
+#define C_RESET "\033[0m"   //prompt colours, used only when stdout is a terminal
+#define C_BOLD  "\033[1m"           //bold text
+#define C_RED   "\033[1;31m"        //bold red: "$" after a failed command
+#define C_CYAN  "\033[1;36m"        //bold cyan: shell name and banner
 
-char root[PATH_MAX];        //real path of the shell root ("" when started in "/")
-size_t rootlen;
-char prevdir[PATH_MAX];     //real path of the previous directory, for "cd -"
+char prevdir[PATH_MAX];     //previous directory, for "cd -"
+char start_dir[PATH_MAX];           //folder where myshell was started (shown by its name, e.g. 4_SH_01)
+size_t start_len=0;                 //length of start_dir (0 = started in "/", nothing to shorten)
 int last_status=0;          //exit status of the last command, for $? and exit
-char *history[HIST_SIZE];
-int hist_total=0;
-struct {pid_t pid;int num;char name[64];} jobs[MAX_JOBS];
-int job_count=0;
+char *history[HIST_SIZE];           //ring buffer of the last commands typed
+int hist_total=0;                   //how many commands were ever added (gives history numbers)
+struct {pid_t pid;int num;char name[64];} jobs[MAX_JOBS];   //running background jobs: pid, job number, command name
+int job_count=0;                    //last job number handed out ([1], [2], ...)
+volatile sig_atomic_t at_prompt=0;  //1 while the shell waits for input (Ctrl+C then moves to a new line)
 
 /* ============ Helpers ============ */
 
-int write_all(int fd,const char *buf,size_t n)
-{
-    ssize_t w;
-    while(n>0)
-    {
-        w=write(fd,buf,n);
-        if(w<0&&errno==EINTR)continue;
-        if(w<=0)return -1;
-        buf+=w;
-        n-=w;
-    }
-    return 0;
-}
-const char *base_name(const char *path)
-{
-    const char *p=strrchr(path,'/');
-    return p?p+1:path;
-}
-//is this real path the root itself or something below it?
-int inside(const char *real)
-{
-    if(rootlen==0)return 1;
-    return strncmp(real,root,rootlen)==0&&(real[rootlen]=='\0'||real[rootlen]=='/');
-}
-//real path -> path inside the shell ("/" is the shell root), used when a path is read back
-const char *virt(const char *real)
-{
-    if(!inside(real))return real;
-    return real[rootlen]?real+rootlen:"/";
-}
-//real path -> path printed for the user (the root is shown by its folder name, e.g. "4_SH_01/a/b")
-const char *show(const char *real)
-{
-    static char shown[PATH_MAX];
-    if(rootlen==0||!inside(real))return virt(real);
-    snprintf(shown,sizeof(shown),"%s%s",base_name(root),real+rootlen);
-    return shown;
-}
-//follow symlinks of the deepest existing part of a real path and make sure it stays inside root
-//returns 0 ok, -1 error (errno), -2 outside root
-int jail_check(const char *path)
-{
-    char tmp[PATH_MAX],real[PATH_MAX],*t;
-    struct stat st;
-    snprintf(tmp,sizeof(tmp),"%s",path);
-    while(1)
-    {
-        if(realpath(tmp,real)!=NULL)return inside(real)?0:-2;
-        if(errno!=ENOENT&&errno!=ENOTDIR)return -1;
-        if(lstat(tmp,&st)==0)return -2;     //dangling symlink: its target is unknown, block it
-        t=strrchr(tmp,'/');
-        if(t==NULL)return -1;
-        if(t==tmp)t[1]='\0';
-        else *t='\0';
-    }
-}
-//turn a user path into a real path inside root
-//"/x" and "~/x" start at root, other paths start at the current folder, ".." can never pass root
-//returns 0 ok, -1 error (errno), -2 outside root
-int resolve(const char *path,char *out)
-{
-    char vp[PATH_MAX*2],cwd[PATH_MAX],*comp[PATH_MAX/2],*t,*save;
-    int n=0,i;
-    size_t len;
-    if(path==NULL||path[0]=='\0'||strcmp(path,"~")==0)path="/";
-    else if(strncmp(path,"~/",2)==0)path++;
-    if(path[0]=='/')snprintf(vp,sizeof(vp),"%s",path);
-    else
-    {
-        if(getcwd(cwd,sizeof(cwd))==NULL)return -1;
-        if(!inside(cwd))return -2;
-        if(strlen(cwd)+strlen(path)+2>sizeof(vp)){errno=ENAMETOOLONG;return -1;}
-        snprintf(vp,sizeof(vp),"%s/%s",cwd+rootlen,path);
-    }
-    for(t=strtok_r(vp,"/",&save);t!=NULL;t=strtok_r(NULL,"/",&save))
-    {
-        if(strcmp(t,".")==0)continue;
-        if(strcmp(t,"..")==0)
-        {
-            if(n==0)return -2;              //trying to go above root
-            n--;
-            continue;
-        }
-        comp[n++]=t;
-    }
-    len=snprintf(out,PATH_MAX,"%s",root);
-    for(i=0;i<n;i++)
-    {
-        if(len+strlen(comp[i])+2>PATH_MAX){errno=ENAMETOOLONG;return -1;}
-        len+=sprintf(out+len,"/%s",comp[i]);
-    }
-    if(len==0)strcpy(out,"/");
-    return jail_check(out);
-}
-//resolve() and print the error message for command cmd
-int fix(const char *cmd,const char *path,char *out)
-{
-    int r=resolve(path,out);
-    if(r==-2)fprintf(stderr,"%s: %s: Permission denied (outside root directory)\n",cmd,path);
-    else if(r==-1)fprintf(stderr,"%s: %s: %s\n",cmd,path,strerror(errno));
-    return r;
-}
+int write_all(int fd,const char *buf,size_t n)  //write all n bytes, even if write() does it in parts
+{                                   //start of write_all
+    ssize_t w;                      //bytes written by one write() call
+    while(n>0)                      //repeat until every byte is out
+    {                               //start of loop body
+        w=write(fd,buf,n);          //system call: write the remaining bytes
+        if(w<0&&errno==EINTR)continue;  //interrupted by a signal: just try again
+        if(w<=0)return -1;          //real error: report failure
+        buf+=w;                     //skip the bytes already written
+        n-=w;                       //fewer bytes left
+    }                               //end of loop
+    return 0;                       //everything written
+}                                   //end of write_all
+const char *base_name(const char *path)     //last part of a path ("a/b/c.txt" -> "c.txt")
+{                                   //start of base_name
+    const char *p=strrchr(path,'/');    //find the last '/'
+    return p?p+1:path;              //text after it, or the whole path if there is no '/'
+}                                   //end of base_name
+//path shown to the user: inside the start folder it is written from the folder's name
+//("/home/u/x/4_SH_01/demo" -> "4_SH_01/demo"); anywhere else the full path is shown
+const char *show_path(const char *real)   //real path -> text shown to the user
+{                                   //start of show_path
+    static char shown[PATH_MAX];    //static so the text stays valid after return
+    if(start_len==0||strncmp(real,start_dir,start_len)!=0)return real;     //not below the start folder: full path
+    if(real[start_len]!='\0'&&real[start_len]!='/')return real;   //only a name prefix ("4_SH_01x"): full path
+    snprintf(shown,sizeof(shown),"%s%s",base_name(start_dir),real+start_len);  //folder name + the rest
+    return shown;                   //e.g. "4_SH_01" or "4_SH_01/demo"
+}                                   //end of show_path
+//"~" and "~/x" become the home folder ($HOME); any other path is passed on unchanged
+//returns 0 ok, -1 error (message printed for command cmd)
+int expand_path(const char *cmd,const char *path,char *out)   //expand "~", copy path into out
+{                                   //start of expand_path
+    const char *home=getenv("HOME");    //home folder from the environment
+    if(home==NULL||home[0]=='\0')home="/";  //no HOME set: use "/" instead
+    if(strcmp(path,"~")==0)path=home;   //"~" alone means the home folder
+    else if(strncmp(path,"~/",2)==0)    //"~/x" means x inside the home folder
+    {                               //start of "~/x" case
+        if(strlen(home)+strlen(path)>=PATH_MAX)     //result would not fit
+        {                           //start of error case
+            fprintf(stderr,"%s: %s: %s\n",cmd,path,strerror(ENAMETOOLONG));  //"cmd: path: File name too long"
+            return -1;              //tell the caller it failed
+        }                           //end of error case
+        snprintf(out,PATH_MAX,"%s%s",home,path+1);  //home + "/x" (skip the '~')
+        return 0;                   //done
+    }                               //end of "~/x" case
+    if(strlen(path)>=PATH_MAX)      //path too long to copy
+    {                               //start of error case
+        fprintf(stderr,"%s: %s: %s\n",cmd,path,strerror(ENAMETOOLONG));  //report it
+        return -1;                  //failure
+    }                               //end of error case
+    snprintf(out,PATH_MAX,"%s",path);   //any other path is copied unchanged; the kernel resolves it
+    return 0;                       //success
+}                                   //end of expand_path
 
 /* ============ 1. File & Directory Inspection Commands ============ */
 
-//pwd: getcwd(), printed relative to the shell root
-int pwd_call(int argc,char *argv[])
-{
-    char cwd[PATH_MAX];
-    if(getcwd(cwd,sizeof(cwd))==NULL)
-    {
-        perror("pwd");
-        return 1;
-    }
-    printf("%s\n",show(cwd));
-    return 0;
-}
-int cmp_names(const void *a,const void *b)
-{
-    return strcmp(*(char *const *)a,*(char *const *)b);
-}
+//pwd: getcwd()
+int pwd_call(int argc,char *argv[])   //pwd command
+{                                   //start of pwd
+    char cwd[PATH_MAX];             //buffer for the current folder
+    if(getcwd(cwd,sizeof(cwd))==NULL)   //system call: ask the kernel for the current folder
+    {                               //start of error case
+        perror("pwd");              //print why it failed
+        return 1;                   //exit status 1
+    }                               //end of error case
+    printf("%s\n",show_path(cwd));  //print it (start folder shown by its name)
+    return 0;                       //success
+}                                   //end of pwd
+int cmp_names(const void *a,const void *b)  //compare two names for qsort (alphabetical order)
+{                                   //start of cmp_names
+    return strcmp(*(char *const *)a,*(char *const *)b);    //each item is a char*, compare the strings
+}                                   //end of cmp_names
 //print one ls line; path is the real path, name is what the user sees
-void ls_entry(const char *path,const char *name,int lflag)
-{
-    struct stat st;
-    struct passwd *pw;
-    char mode[11],tbuf[32],link[PATH_MAX];
-    const char *rwx="rwxrwxrwx";
-    int i,special=strcmp(name,".")==0||strcmp(name,"..")==0;
-    ssize_t n;
-    if(!lflag)
-    {
-        if(!special&&stat(path,&st)==0&&S_ISDIR(st.st_mode))printf("%s/\n",name);
-        else printf("%s\n",name);
-        return;
-    }
-    if(lstat(path,&st)!=0)
-    {
-        fprintf(stderr,"ls: cannot access '%s': %s\n",name,strerror(errno));
-        return;
-    }
-    mode[0]=S_ISDIR(st.st_mode)?'d':S_ISLNK(st.st_mode)?'l':'-';
-    for(i=0;i<9;i++)mode[i+1]=(st.st_mode&(0400>>i))?rwx[i]:'-';
-    mode[10]='\0';
-    pw=getpwuid(st.st_uid);
-    strftime(tbuf,sizeof(tbuf),"%b %e %H:%M",localtime(&st.st_mtime));
-    printf("%s %2ld %-8s %8lld %s %s",mode,(long)st.st_nlink,pw?pw->pw_name:"?",(long long)st.st_size,tbuf,name);
-    if(S_ISLNK(st.st_mode)&&(n=readlink(path,link,sizeof(link)-1))>=0)
-    {
-        link[n]='\0';
-        printf(" -> %s",link);
-    }
-    else if(S_ISDIR(st.st_mode)&&!special)printf("/");
-    printf("\n");
-}
+void ls_entry(const char *path,const char *name,int lflag)   //print one entry of ls
+{                                   //start of ls_entry
+    struct stat st;                 //file information from stat()
+    struct passwd *pw;              //owner information from getpwuid()
+    char mode[11],tbuf[32];         //"drwxr-xr-x" text and the date text
+    const char *rwx="rwxrwxrwx";    //letters for the 9 permission bits
+    int i,special=strcmp(name,".")==0||strcmp(name,"..")==0;   //"." and ".." get no trailing '/'
+    if(!lflag)                      //short format: only the name
+    {                               //start of short format
+        if(!special&&stat(path,&st)==0&&S_ISDIR(st.st_mode))printf("%s/\n",name);    //folder: add '/'
+        else printf("%s\n",name);   //file: name only
+        return;                     //done with this entry
+    }                               //end of short format
+    if(stat(path,&st)!=0)           //system call: read size, mode, owner, time
+    {                               //start of error case
+        fprintf(stderr,"ls: cannot access '%s': %s\n",name,strerror(errno));  //report it
+        return;                     //skip this entry
+    }                               //end of error case
+    mode[0]=S_ISDIR(st.st_mode)?'d':'-';    //first letter: d for a folder
+    for(i=0;i<9;i++)mode[i+1]=(st.st_mode&(0400>>i))?rwx[i]:'-';    //test each permission bit from 0400 down
+    mode[10]='\0';                  //end the mode string
+    pw=getpwuid(st.st_uid);         //owner id -> owner name
+    strftime(tbuf,sizeof(tbuf),"%b %e %H:%M",localtime(&st.st_mtime));    //modification time as "Oct 17 19:45"
+    printf("%s %2ld %-8s %8lld %s %s",mode,(long)st.st_nlink,pw?pw->pw_name:"?",(long long)st.st_size,tbuf,name);   //mode, links, owner, size, date, name
+    if(S_ISDIR(st.st_mode)&&!special)printf("/");  //folders end with '/'
+    printf("\n");                   //end of the line
+}                                   //end of ls_entry
 //ls [-a] [-l] [path...]: opendir(), readdir(), closedir(), stat()
-int ls_call(int argc,char *argv[])
-{
-    char *targets[MAX_ARGS],real[PATH_MAX],path[PATH_MAX+512],**names,*p;
-    int i,j,n,cap,aflag=0,lflag=0,ntarget=0,ret=0;
-    DIR *dir;
-    struct dirent *e;
-    struct stat st;
-    for(i=1;i<argc;i++)
-    {
-        if(argv[i][0]=='-'&&argv[i][1]!='\0')
-        {
-            for(p=argv[i]+1;*p;p++)
-            {
-                if(*p=='a')aflag=1;
-                else if(*p=='l')lflag=1;
-                else
-                {
-                    fprintf(stderr,"ls: invalid option -- '%c'\n",*p);
-                    return 2;
-                }
-            }
-        }
-        else targets[ntarget++]=argv[i];
-    }
-    if(ntarget==0)targets[ntarget++]=".";
-    for(i=0;i<ntarget;i++)
-    {
-        if(fix("ls",targets[i],real)!=0){ret=1;continue;}
-        if(stat(real,&st)!=0)
-        {
-            fprintf(stderr,"ls: cannot access '%s': %s\n",targets[i],strerror(errno));
-            ret=1;
-            continue;
-        }
-        if(!S_ISDIR(st.st_mode))
-        {
-            ls_entry(real,targets[i],lflag);
-            continue;
-        }
-        dir=opendir(real);
-        if(dir==NULL)
-        {
-            fprintf(stderr,"ls: cannot open directory '%s': %s\n",targets[i],strerror(errno));
-            ret=1;
-            continue;
-        }
-        if(ntarget>1)printf("%s%s:\n",i?"\n":"",targets[i]);
-        n=0;
-        cap=64;
-        names=malloc(cap*sizeof(char *));
-        while((e=readdir(dir))!=NULL)
-        {
+int ls_call(int argc,char *argv[])   //ls command
+{                                   //start of ls
+    char *targets[MAX_ARGS],real[PATH_MAX],path[PATH_MAX+512],**names,*p;  //paths to list, full entry path, sorted names
+    int i,j,n,cap,aflag=0,lflag=0,ntarget=0,ret=0;     //counters, option flags, exit status
+    DIR *dir;                       //open folder handle
+    struct dirent *e;               //one folder entry from readdir()
+    struct stat st;                 //information about each target
+    for(i=1;i<argc;i++)             //look at every argument
+    {                               //start of argument loop
+        if(argv[i][0]=='-'&&argv[i][1]!='\0')  //it is an option like -l or -la
+        {                           //start of option case
+            for(p=argv[i]+1;*p;p++) //each letter after the '-'
+            {                       //start of letter loop
+                if(*p=='a')aflag=1; //-a: show hidden files
+                else if(*p=='l')lflag=1;    //-l: long format
+                else                //any other letter is not supported
+                {                   //start of error case
+                    fprintf(stderr,"ls: invalid option -- '%c'\n",*p);    //report it
+                    return 2;       //status 2 like GNU ls
+                }                   //end of error case
+            }                       //end of letter loop
+        }                           //end of option case
+        else targets[ntarget++]=argv[i];    //not an option: a path to list
+    }                               //end of argument loop
+    if(ntarget==0)targets[ntarget++]=".";   //no path given: list the current folder
+    for(i=0;i<ntarget;i++)          //list each target
+    {                               //start of target loop
+        if(expand_path("ls",targets[i],real)!=0){ret=1;continue;}  //handle "~"; skip on error
+        if(stat(real,&st)!=0)       //system call: does it exist, and what is it?
+        {                           //start of error case
+            fprintf(stderr,"ls: cannot access '%s': %s\n",targets[i],strerror(errno));    //e.g. No such file
+            ret=1;                  //remember the failure
+            continue;               //go to the next target
+        }                           //end of error case
+        if(!S_ISDIR(st.st_mode))    //a file: print just that one entry
+        {                           //start of file case
+            ls_entry(real,targets[i],lflag);    //print it
+            continue;               //next target
+        }                           //end of file case
+        dir=opendir(real);          //system call: open the folder for reading
+        if(dir==NULL)               //could not open it (e.g. no permission)
+        {                           //start of error case
+            fprintf(stderr,"ls: cannot open directory '%s': %s\n",targets[i],strerror(errno));   //report it
+            ret=1;                  //remember the failure
+            continue;               //next target
+        }                           //end of error case
+        if(ntarget>1)printf("%s%s:\n",i?"\n":"",targets[i]);  //several folders: print a "name:" header
+        n=0;                        //no names collected yet
+        cap=64;                     //start with room for 64 names
+        names=malloc(cap*sizeof(char *));   //array of name pointers
+        while((e=readdir(dir))!=NULL)   //system call: read entries one by one
+        {                           //start of readdir loop
             if(e->d_name[0]=='.'&&!aflag)continue;      //hidden files only with -a
-            if(strcmp(e->d_name,"..")==0&&strcmp(real,root)==0)continue;   //nothing above root
-            if(n==cap)
-            {
-                cap*=2;
-                names=realloc(names,cap*sizeof(char *));
-            }
-            names[n++]=strdup(e->d_name);
-        }
-        closedir(dir);
-        qsort(names,n,sizeof(char *),cmp_names);
-        for(j=0;j<n;j++)
-        {
-            snprintf(path,sizeof(path),"%s/%s",real,names[j]);
-            ls_entry(path,names[j],lflag);
-            free(names[j]);
-        }
-        free(names);
-    }
-    return ret;
-}
+            if(n==cap)              //array is full
+            {                       //start of grow case
+                cap*=2;             //double the room
+                names=realloc(names,cap*sizeof(char *));    //grow the array
+            }                       //end of grow case
+            names[n++]=strdup(e->d_name);   //keep a copy of the name
+        }                           //end of readdir loop
+        closedir(dir);              //system call: close the folder
+        qsort(names,n,sizeof(char *),cmp_names);    //sort names alphabetically
+        for(j=0;j<n;j++)            //print each name
+        {                           //start of print loop
+            snprintf(path,sizeof(path),"%s/%s",real,names[j]);    //full path, needed for stat()
+            ls_entry(path,names[j],lflag);  //print one line
+            free(names[j]);         //free the copied name
+        }                           //end of print loop
+        free(names);                //free the array
+    }                               //end of target loop
+    return ret;                     //0 if all went well, else 1
+}                                   //end of ls
 //whoami: getuid(), getpwuid()
-int whoami_call(int argc,char *argv[])
-{
-    struct passwd *pw=getpwuid(getuid());
-    if(pw==NULL)
-    {
-        perror("whoami");
-        return 1;
-    }
-    printf("%s\n",pw->pw_name);
-    return 0;
-}
+int whoami_call(int argc,char *argv[])   //whoami command
+{                                   //start of whoami
+    struct passwd *pw=getpwuid(getuid());   //system calls: my user id -> password entry
+    if(pw==NULL)                    //no entry found
+    {                               //start of error case
+        perror("whoami");           //report it
+        return 1;                   //failure
+    }                               //end of error case
+    printf("%s\n",pw->pw_name);     //print the user name
+    return 0;                       //success
+}                                   //end of whoami
 //uname [-a -s -n -r -v -m]: uname()
-int uname_call(int argc,char *argv[])
-{
-    struct utsname u;
-    int i,show[5]={0},first=1;
-    char *p,*opts="snrvm",*q;
-    char *field[5];
-    if(uname(&u)!=0)
-    {
-        perror("uname");
-        return 1;
-    }
-    if(argc==1)
-    {
-        printf("System Name : %s\n",u.sysname);
-        printf("Node Name   : %s\n",u.nodename);
-        printf("Release     : %s\n",u.release);
-        printf("Version     : %s\n",u.version);
-        printf("Machine     : %s\n",u.machine);
-        return 0;
-    }
-    for(i=1;i<argc;i++)
-    {
-        if(argv[i][0]!='-'||argv[i][1]=='\0')
-        {
-            fprintf(stderr,"uname: extra operand '%s'\n",argv[i]);
-            return 1;
-        }
-        for(p=argv[i]+1;*p;p++)
-        {
-            if(*p=='a')show[0]=show[1]=show[2]=show[3]=show[4]=1;
-            else if((q=strchr(opts,*p))!=NULL)show[q-opts]=1;
-            else
-            {
-                fprintf(stderr,"uname: invalid option -- '%c'\n",*p);
-                return 1;
-            }
-        }
-    }
-    field[0]=u.sysname;field[1]=u.nodename;field[2]=u.release;field[3]=u.version;field[4]=u.machine;
-    for(i=0;i<5;i++)
-    {
-        if(!show[i])continue;
-        printf("%s%s",first?"":" ",field[i]);
-        first=0;
-    }
-    printf("\n");
-    return 0;
-}
+int uname_call(int argc,char *argv[])   //uname command
+{                                   //start of uname
+    struct utsname u;               //filled by the uname() system call
+    int i,show[5]={0},first=1;      //which fields to print; first avoids a leading space
+    char *p,*opts="snrvm",*q;       //option letters in field order
+    char *field[5];                 //pointers to the 5 fields
+    if(uname(&u)!=0)                //system call: get system information
+    {                               //start of error case
+        perror("uname");            //report it
+        return 1;                   //failure
+    }                               //end of error case
+    if(argc==1)                     //no options: print a labelled table
+    {                               //start of table case
+        printf("System Name : %s\n",u.sysname);    //e.g. Linux
+        printf("Node Name   : %s\n",u.nodename);   //host name
+        printf("Release     : %s\n",u.release);    //kernel release
+        printf("Version     : %s\n",u.version);    //kernel build version
+        printf("Machine     : %s\n",u.machine);    //architecture, e.g. x86_64
+        return 0;                   //done
+    }                               //end of table case
+    for(i=1;i<argc;i++)             //read the options
+    {                               //start of option loop
+        if(argv[i][0]!='-'||argv[i][1]=='\0')  //not an option: uname takes no operands
+        {                           //start of error case
+            fprintf(stderr,"uname: extra operand '%s'\n",argv[i]);   //report it
+            return 1;               //failure
+        }                           //end of error case
+        for(p=argv[i]+1;*p;p++)     //each letter of the option
+        {                           //start of letter loop
+            if(*p=='a')show[0]=show[1]=show[2]=show[3]=show[4]=1;  //-a: all fields
+            else if((q=strchr(opts,*p))!=NULL)show[q-opts]=1;      //-s -n -r -v -m: mark that field
+            else                    //unknown letter
+            {                       //start of error case
+                fprintf(stderr,"uname: invalid option -- '%c'\n",*p);    //report it
+                return 1;           //failure
+            }                       //end of error case
+        }                           //end of letter loop
+    }                               //end of option loop
+    field[0]=u.sysname;field[1]=u.nodename;field[2]=u.release;field[3]=u.version;field[4]=u.machine;  //fields in -s -n -r -v -m order
+    for(i=0;i<5;i++)                //print the chosen fields
+    {                               //start of print loop
+        if(!show[i])continue;       //not asked for
+        printf("%s%s",first?"":" ",field[i]);  //space between fields
+        first=0;                    //later fields need a space
+    }                               //end of print loop
+    printf("\n");                   //end of the line
+    return 0;                       //success
+}                                   //end of uname
 
 /* ============ 2. File & Directory Manipulation Commands ============ */
 
 //mkdir -p: create every missing folder on the way
-int mkdir_parents(char *real)
-{
-    char *p;
-    struct stat st;
-    if(real[rootlen]=='\0')return 0;            //the root always exists
-    for(p=real+rootlen+1;*p;p++)
-    {
-        if(*p!='/')continue;
-        *p='\0';
-        if(mkdir(real,0755)!=0&&errno!=EEXIST){*p='/';return -1;}
-        *p='/';
-    }
-    if(mkdir(real,0755)!=0)
-    {
-        if(errno==EEXIST&&stat(real,&st)==0&&S_ISDIR(st.st_mode))return 0;
-        return -1;
-    }
-    return 0;
-}
+int mkdir_parents(char *real)   //helper for mkdir -p
+{                                   //start of mkdir_parents
+    char *p;                        //walks along the path
+    struct stat st;                 //used to check an existing folder
+    for(p=real+1;*p;p++)            //look at each character (skip a leading '/')
+    {                               //start of path loop
+        if(*p!='/')continue;        //only stop at each '/'
+        *p='\0';                    //cut the path here: "a/b/c" -> "a"
+        if(mkdir(real,0755)!=0&&errno!=EEXIST){*p='/';return -1;}    //create this part; existing is fine
+        *p='/';                     //put the '/' back
+    }                               //end of path loop
+    if(mkdir(real,0755)!=0)         //create the last folder
+    {                               //start of error case
+        if(errno==EEXIST&&stat(real,&st)==0&&S_ISDIR(st.st_mode))return 0;    //already a folder: fine with -p
+        return -1;                  //real failure (or a file with that name)
+    }                               //end of error case
+    return 0;                       //success
+}                                   //end of mkdir_parents
 //mkdir [-p] dir...: mkdir() with mode 0755
-int mkdir_call(int argc,char *argv[])
-{
-    char real[PATH_MAX];
-    int i,pflag=0,count=0,ret=0;
-    for(i=1;i<argc;i++)
-    {
-        if(strcmp(argv[i],"-p")==0)pflag=1;
-        else if(argv[i][0]=='-'&&argv[i][1]!='\0')
-        {
-            fprintf(stderr,"mkdir: invalid option '%s'\n",argv[i]);
-            return 1;
-        }
-        else count++;
-    }
-    if(count==0)
-    {
-        fprintf(stderr,"usage: mkdir [-p] <directory> ...\n");
-        return 1;
-    }
-    for(i=1;i<argc;i++)
-    {
-        if(strcmp(argv[i],"-p")==0)continue;
-        if(fix("mkdir",argv[i],real)!=0){ret=1;continue;}
-        if((pflag?mkdir_parents(real):mkdir(real,0755))!=0)
-        {
-            fprintf(stderr,"mkdir: cannot create directory '%s': %s\n",argv[i],strerror(errno));
-            ret=1;
-        }
-    }
-    return ret;
-}
+int mkdir_call(int argc,char *argv[])   //mkdir command
+{                                   //start of mkdir
+    char real[PATH_MAX];            //path after "~" expansion
+    int i,pflag=0,count=0,ret=0;    //-p flag, number of folders, exit status
+    for(i=1;i<argc;i++)             //first pass: read options and count folders
+    {                               //start of option loop
+        if(strcmp(argv[i],"-p")==0)pflag=1;    //-p: make parents too
+        else if(argv[i][0]=='-'&&argv[i][1]!='\0')     //any other option is invalid
+        {                           //start of error case
+            fprintf(stderr,"mkdir: invalid option '%s'\n",argv[i]);    //report it
+            return 1;               //failure
+        }                           //end of error case
+        else count++;               //a folder name
+    }                               //end of option loop
+    if(count==0)                    //no folder given
+    {                               //start of error case
+        fprintf(stderr,"usage: mkdir [-p] <directory> ...\n");     //show the usage
+        return 1;                   //failure
+    }                               //end of error case
+    for(i=1;i<argc;i++)             //second pass: create each folder
+    {                               //start of create loop
+        if(strcmp(argv[i],"-p")==0)continue;   //skip the option itself
+        if(expand_path("mkdir",argv[i],real)!=0){ret=1;continue;}  //handle "~"
+        if((pflag?mkdir_parents(real):mkdir(real,0755))!=0)  //system call mkdir() with mode 0755
+        {                           //start of error case
+            fprintf(stderr,"mkdir: cannot create directory '%s': %s\n",argv[i],strerror(errno));     //e.g. File exists
+            ret=1;                  //remember the failure, keep going
+        }                           //end of error case
+    }                               //end of create loop
+    return ret;                     //0 if all were created
+}                                   //end of mkdir
 //touch file...: open() with O_CREAT, then utimensat() to set the time to now
-int touch_call(int argc,char *argv[])
-{
-    char real[PATH_MAX];
-    int i,fd,ret=0;
-    if(argc<2)
-    {
-        fprintf(stderr,"usage: touch <file> ...\n");
-        return 1;
-    }
-    for(i=1;i<argc;i++)
-    {
-        if(fix("touch",argv[i],real)!=0){ret=1;continue;}
-        fd=open(real,O_WRONLY|O_CREAT|O_NONBLOCK,0644);
-        if(fd<0&&errno!=EISDIR)
-        {
-            fprintf(stderr,"touch: cannot touch '%s': %s\n",argv[i],strerror(errno));
-            ret=1;
-            continue;
-        }
-        if(fd>=0)close(fd);
-        if(utimensat(AT_FDCWD,real,NULL,0)!=0)
-        {
-            fprintf(stderr,"touch: cannot touch '%s': %s\n",argv[i],strerror(errno));
-            ret=1;
-        }
-    }
-    return ret;
-}
-//rm -r: remove a folder and everything inside it (symlinks are removed, never followed)
-int remove_tree(const char *path)
-{
-    char sub[PATH_MAX+512];
-    struct stat st;
-    struct dirent *e;
-    DIR *dir;
-    int ret=0;
-    if(lstat(path,&st)!=0)return -1;
-    if(!S_ISDIR(st.st_mode))return unlink(path);
-    dir=opendir(path);
-    if(dir==NULL)return -1;
-    while((e=readdir(dir))!=NULL)
-    {
-        if(strcmp(e->d_name,".")==0||strcmp(e->d_name,"..")==0)continue;
-        snprintf(sub,sizeof(sub),"%s/%s",path,e->d_name);
-        if(remove_tree(sub)!=0)ret=-1;
-    }
-    closedir(dir);
-    if(rmdir(path)!=0)ret=-1;
-    return ret;
-}
+int touch_call(int argc,char *argv[])   //touch command
+{                                   //start of touch
+    char real[PATH_MAX];            //path after "~" expansion
+    int i,fd,ret=0;                 //counter, file descriptor, exit status
+    if(argc<2)                      //no file given
+    {                               //start of error case
+        fprintf(stderr,"usage: touch <file> ...\n");   //show the usage
+        return 1;                   //failure
+    }                               //end of error case
+    for(i=1;i<argc;i++)             //each file
+    {                               //start of file loop
+        if(expand_path("touch",argv[i],real)!=0){ret=1;continue;}  //handle "~"
+        fd=open(real,O_WRONLY|O_CREAT|O_NONBLOCK,0644);    //system call: create if missing (mode 644), keep content
+        if(fd<0&&errno!=EISDIR)     //failed, and not because it is a folder
+        {                           //start of error case
+            fprintf(stderr,"touch: cannot touch '%s': %s\n",argv[i],strerror(errno));     //report it
+            ret=1;                  //remember the failure
+            continue;               //next file
+        }                           //end of error case
+        if(fd>=0)close(fd);         //system call: close it again
+        if(utimensat(AT_FDCWD,real,NULL,0)!=0)     //system call: set access/modify time to now (works on folders too)
+        {                           //start of error case
+            fprintf(stderr,"touch: cannot touch '%s': %s\n",argv[i],strerror(errno));     //report it
+            ret=1;                  //remember the failure
+        }                           //end of error case
+    }                               //end of file loop
+    return ret;                     //0 if all succeeded
+}                                   //end of touch
+//rm -r: remove a folder and everything inside it
+//unlink() is tried first: it removes files and symlinks (never following them) and fails with EISDIR on a folder
+int remove_tree(const char *path)   //helper for rm -r (recursive)
+{                                   //start of remove_tree
+    char sub[PATH_MAX+512];         //path of one entry inside the folder
+    struct dirent *e;               //one folder entry
+    DIR *dir;                       //open folder handle
+    int ret=0;                      //0 = all removed
+    if(unlink(path)==0)return 0;    //system call: a file or a symlink is removed right here
+    if(errno!=EISDIR)return -1;     //failed for another reason than "is a folder"
+    dir=opendir(path);              //system call: open the folder
+    if(dir==NULL)return -1;         //cannot open it
+    while((e=readdir(dir))!=NULL)   //system call: each entry inside
+    {                               //start of entry loop
+        if(strcmp(e->d_name,".")==0||strcmp(e->d_name,"..")==0)continue;  //never touch "." and ".."
+        snprintf(sub,sizeof(sub),"%s/%s",path,e->d_name);  //full path of the entry
+        if(remove_tree(sub)!=0)ret=-1;  //remove it (recursively); remember any failure
+    }                               //end of entry loop
+    closedir(dir);                  //system call: close the folder
+    if(rmdir(path)!=0)ret=-1;       //system call: remove the now empty folder
+    return ret;                     //0 if everything was removed
+}                                   //end of remove_tree
 //rm [-r] [-f] path...: unlink() for files, rmdir() for empty folders
-int rm_call(int argc,char *argv[])
-{
-    char real[PATH_MAX],cwd[PATH_MAX],name[PATH_MAX],*p;
-    const char *b;
-    int i,rflag=0,fflag=0,count=0,ret=0;
-    size_t len;
-    struct stat st;
-    for(i=1;i<argc;i++)
-    {
-        if(argv[i][0]=='-'&&argv[i][1]!='\0')
-        {
-            for(p=argv[i]+1;*p;p++)
-            {
-                if(*p=='r'||*p=='R')rflag=1;
-                else if(*p=='f')fflag=1;
-                else
-                {
-                    fprintf(stderr,"rm: invalid option -- '%c'\n",*p);
-                    return 1;
-                }
-            }
-        }
-        else count++;
-    }
-    if(count==0)
-    {
-        fprintf(stderr,"usage: rm [-r] [-f] <file | directory> ...\n");
-        return 1;
-    }
-    for(i=1;i<argc;i++)
-    {
-        if(argv[i][0]=='-'&&argv[i][1]!='\0')continue;
-        snprintf(name,sizeof(name),"%s",argv[i]);
-        len=strlen(name);
-        while(len>1&&name[len-1]=='/')name[--len]='\0';
-        b=base_name(name);
-        if(strcmp(b,".")==0||strcmp(b,"..")==0)
-        {
-            fprintf(stderr,"rm: refusing to remove '.' or '..' directory: skipping '%s'\n",argv[i]);
-            ret=1;
-            continue;
-        }
-        if(fix("rm",argv[i],real)!=0){ret=1;continue;}
-        if(strcmp(real,root[0]?root:"/")==0)
-        {
-            fprintf(stderr,"rm: refusing to remove the root directory '/'\n");
-            ret=1;
-            continue;
-        }
-        len=strlen(real);
-        if(getcwd(cwd,sizeof(cwd))!=NULL&&strncmp(cwd,real,len)==0&&(cwd[len]=='\0'||cwd[len]=='/'))
-        {
-            fprintf(stderr,"rm: cannot remove '%s': current directory is inside it\n",argv[i]);
-            ret=1;
-            continue;
-        }
-        if(lstat(real,&st)!=0)
-        {
-            if(fflag&&errno==ENOENT)continue;
-            fprintf(stderr,"rm: cannot remove '%s': %s\n",argv[i],strerror(errno));
-            ret=1;
-            continue;
-        }
-        if(S_ISDIR(st.st_mode))
-        {
-            if((rflag?remove_tree(real):rmdir(real))!=0)
-            {
-                if(errno==ENOTEMPTY||errno==EEXIST)fprintf(stderr,"rm: cannot remove '%s': Directory not empty (use rm -r)\n",argv[i]);
-                else fprintf(stderr,"rm: cannot remove '%s': %s\n",argv[i],strerror(errno));
-                ret=1;
-            }
-        }
-        else if(unlink(real)!=0)
-        {
-            fprintf(stderr,"rm: cannot remove '%s': %s\n",argv[i],strerror(errno));
-            ret=1;
-        }
-    }
-    return ret;
-}
+int rm_call(int argc,char *argv[])   //rm command
+{                                   //start of rm
+    char real[PATH_MAX],cwd[PATH_MAX],name[PATH_MAX],*p;   //expanded path, current folder, cleaned name
+    const char *b;                  //last part of the name
+    int i,rflag=0,fflag=0,count=0,ret=0;   //-r, -f, number of paths, exit status
+    size_t len;                     //string length helper
+    for(i=1;i<argc;i++)             //first pass: options and count
+    {                               //start of option loop
+        if(argv[i][0]=='-'&&argv[i][1]!='\0')  //an option like -r, -f, -rf
+        {                           //start of option case
+            for(p=argv[i]+1;*p;p++) //each letter
+            {                       //start of letter loop
+                if(*p=='r'||*p=='R')rflag=1;   //-r / -R: recursive
+                else if(*p=='f')fflag=1;    //-f: ignore missing files
+                else                //unknown letter
+                {                   //start of error case
+                    fprintf(stderr,"rm: invalid option -- '%c'\n",*p);    //report it
+                    return 1;       //failure
+                }                   //end of error case
+            }                       //end of letter loop
+        }                           //end of option case
+        else count++;               //a path to remove
+    }                               //end of option loop
+    if(count==0)                    //nothing to remove
+    {                               //start of error case
+        fprintf(stderr,"usage: rm [-r] [-f] <file | directory> ...\n");    //show the usage
+        return 1;                   //failure
+    }                               //end of error case
+    for(i=1;i<argc;i++)             //second pass: remove each path
+    {                               //start of remove loop
+        if(argv[i][0]=='-'&&argv[i][1]!='\0')continue;     //skip options
+        snprintf(name,sizeof(name),"%s",argv[i]);  //copy the name to clean it
+        len=strlen(name);           //its length
+        while(len>1&&name[len-1]=='/')name[--len]='\0';    //drop trailing '/' ("dir/" -> "dir")
+        b=base_name(name);          //last part of the name
+        if(strcmp(b,".")==0||strcmp(b,"..")==0)    //safety: never remove "." or ".."
+        {                           //start of refuse case
+            fprintf(stderr,"rm: refusing to remove '.' or '..' directory: skipping '%s'\n",argv[i]);  //explain
+            ret=1;                  //failure for this one
+            continue;               //next path
+        }                           //end of refuse case
+        if(expand_path("rm",argv[i],real)!=0){ret=1;continue;}     //handle "~"
+        len=strlen(real);           //length of the expanded path
+        while(len>1&&real[len-1]=='/')real[--len]='\0';     //"//" is "/" too
+        if(strcmp(real,"/")==0)     //safety: never remove the root folder
+        {                           //start of refuse case
+            fprintf(stderr,"rm: refusing to remove the root directory '/'\n");     //explain
+            ret=1;                  //failure for this one
+            continue;               //next path
+        }                           //end of refuse case
+        len=strlen(real);           //length again for the prefix test
+        if(getcwd(cwd,sizeof(cwd))!=NULL&&strncmp(cwd,real,len)==0&&(cwd[len]=='\0'||cwd[len]=='/'))  //safety: we are inside it
+        {                           //start of refuse case
+            fprintf(stderr,"rm: cannot remove '%s': current directory is inside it\n",argv[i]);    //explain
+            ret=1;                  //failure for this one
+            continue;               //next path
+        }                           //end of refuse case
+        if(unlink(real)==0)continue;                //file or symlink
+        if(errno==ENOENT&&fflag)continue;   //missing and -f given: stay quiet
+        if(errno!=EISDIR)           //any error other than "is a folder"
+        {                           //start of error case
+            fprintf(stderr,"rm: cannot remove '%s': %s\n",argv[i],strerror(errno));   //e.g. No such file
+            ret=1;                  //remember the failure
+            continue;               //next path
+        }                           //end of error case
+        if((rflag?remove_tree(real):rmdir(real))!=0)  //folder
+        {                           //start of error case
+            if(errno==ENOTEMPTY||errno==EEXIST)fprintf(stderr,"rm: cannot remove '%s': Directory not empty (use rm -r)\n",argv[i]);   //hint to use -r
+            else fprintf(stderr,"rm: cannot remove '%s': %s\n",argv[i],strerror(errno));  //other reason
+            ret=1;                  //remember the failure
+        }                           //end of error case
+    }                               //end of remove loop
+    return ret;                     //0 if everything was removed
+}                                   //end of rm
 //copy one regular file with read() and write()
-int copy_file(const char *src,const char *dst,const char *dname,mode_t mode)
-{
-    char buf[BUF_SIZE];
-    int in,out;
-    ssize_t n;
-    in=open(src,O_RDONLY);
-    if(in<0)
-    {
-        perror("cp: source");
-        return 1;
-    }
-    out=open(dst,O_WRONLY|O_CREAT|O_TRUNC,mode&0777);
-    if(out<0)
-    {
-        fprintf(stderr,"cp: cannot create '%s': %s\n",dname,strerror(errno));
-        close(in);
-        return 1;
-    }
-    while((n=read(in,buf,sizeof(buf)))>0)
-    {
-        if(write_all(out,buf,n)!=0)
-        {
-            perror("cp: write");
-            break;
-        }
-    }
-    if(n<0)perror("cp: read");
-    close(in);
-    close(out);
-    return n!=0;
-}
+int copy_file(const char *src,const char *dst,const char *sname,const char *dname,mode_t mode)   //copy src to dst; sname/dname are the names shown in errors
+{                                   //start of copy_file
+    char buf[BUF_SIZE];             //copy buffer (4 KB)
+    int in,out;                     //source and destination file descriptors
+    ssize_t n;                      //bytes read in one step
+    in=open(src,O_RDONLY);          //system call: open the source for reading
+    if(in<0)                        //cannot open it
+    {                               //start of error case
+        fprintf(stderr,"cp: cannot open '%s' for reading: %s\n",sname,strerror(errno));  //e.g. Permission denied
+        return 1;                   //failure
+    }                               //end of error case
+    out=open(dst,O_WRONLY|O_CREAT|O_TRUNC,mode&0777);  //system call: create/empty the destination with the source's mode
+    if(out<0)                       //cannot create it
+    {                               //start of error case
+        fprintf(stderr,"cp: cannot create '%s': %s\n",dname,strerror(errno));     //report it
+        close(in);                  //do not leak the source fd
+        return 1;                   //failure
+    }                               //end of error case
+    while((n=read(in,buf,sizeof(buf)))>0)   //system call: read the next block
+    {                               //start of copy loop
+        if(write_all(out,buf,n)!=0) //write the same block to the destination
+        {                           //start of error case
+            perror("cp: write");    //e.g. disk full
+            break;                  //stop copying
+        }                           //end of error case
+    }                               //end of copy loop
+    if(n<0)perror("cp: read");      //read() failed
+    close(in);                      //system call: close the source
+    close(out);                     //system call: close the destination
+    return n!=0;                    //0 only when read() reached the end of the file
+}                                   //end of copy_file
 //cp src dst | cp src... dir
-int cp_call(int argc,char *argv[])
-{
-    char src[PATH_MAX],dst[PATH_MAX],target[PATH_MAX+512];
-    struct stat ss,ds;
-    int i,isdir,ret=0;
-    if(argc<3)
-    {
-        fprintf(stderr,"usage: cp <source> <destination>  |  cp <source>... <directory>\n");
-        return 1;
-    }
-    if(fix("cp",argv[argc-1],dst)!=0)return 1;
-    isdir=stat(dst,&ds)==0&&S_ISDIR(ds.st_mode);
-    if(argc>3&&!isdir)
-    {
-        fprintf(stderr,"cp: target '%s' is not a directory\n",argv[argc-1]);
-        return 1;
-    }
-    for(i=1;i<argc-1;i++)
-    {
-        if(fix("cp",argv[i],src)!=0){ret=1;continue;}
-        if(stat(src,&ss)!=0)
-        {
-            fprintf(stderr,"cp: cannot stat '%s': %s\n",argv[i],strerror(errno));
-            ret=1;
-            continue;
-        }
-        if(S_ISDIR(ss.st_mode))
-        {
-            fprintf(stderr,"cp: -r not specified; omitting directory '%s'\n",argv[i]);
-            ret=1;
-            continue;
-        }
-        if(isdir)snprintf(target,sizeof(target),"%s/%s",dst,base_name(src));
-        else snprintf(target,sizeof(target),"%s",dst);
-        if(jail_check(target)==-2)
-        {
-            fprintf(stderr,"cp: %s: Permission denied (outside root directory)\n",argv[argc-1]);
-            ret=1;
-            continue;
-        }
-        if(stat(target,&ds)==0&&ds.st_dev==ss.st_dev&&ds.st_ino==ss.st_ino)
-        {
-            fprintf(stderr,"cp: '%s' and '%s' are the same file\n",argv[i],argv[argc-1]);
-            ret=1;
-            continue;
-        }
-        if(copy_file(src,target,argv[argc-1],ss.st_mode)!=0)ret=1;
-    }
-    return ret;
-}
+int cp_call(int argc,char *argv[])   //cp command
+{                                   //start of cp
+    char src[PATH_MAX],dst[PATH_MAX],target[PATH_MAX+512];     //source, destination, final target path
+    struct stat ss,ds;              //information about source and destination
+    int i,isdir,ret=0;              //counter, "destination is a folder", exit status
+    if(argc<3)                      //need at least a source and a destination
+    {                               //start of error case
+        fprintf(stderr,"usage: cp <source> <destination>  |  cp <source>... <directory>\n");  //show the usage
+        return 1;                   //failure
+    }                               //end of error case
+    if(expand_path("cp",argv[argc-1],dst)!=0)return 1;     //last argument is the destination
+    isdir=stat(dst,&ds)==0&&S_ISDIR(ds.st_mode);   //system call: is the destination a folder?
+    if(argc>3&&!isdir)              //several sources need a folder as destination
+    {                               //start of error case
+        fprintf(stderr,"cp: target '%s' is not a directory\n",argv[argc-1]);   //report it
+        return 1;                   //failure
+    }                               //end of error case
+    for(i=1;i<argc-1;i++)           //copy each source
+    {                               //start of source loop
+        if(expand_path("cp",argv[i],src)!=0){ret=1;continue;}  //handle "~"
+        if(stat(src,&ss)!=0)        //system call: source must exist
+        {                           //start of error case
+            fprintf(stderr,"cp: cannot stat '%s': %s\n",argv[i],strerror(errno));     //e.g. No such file
+            ret=1;                  //remember the failure
+            continue;               //next source
+        }                           //end of error case
+        if(S_ISDIR(ss.st_mode))     //folders are not copied (no -r)
+        {                           //start of error case
+            fprintf(stderr,"cp: -r not specified; omitting directory '%s'\n",argv[i]);    //explain
+            ret=1;                  //remember the failure
+            continue;               //next source
+        }                           //end of error case
+        if(isdir)snprintf(target,sizeof(target),"%s/%s",dst,base_name(src));  //into a folder: keep the file name
+        else snprintf(target,sizeof(target),"%s",dst);  //otherwise copy to the given name
+        if(stat(target,&ds)==0&&ds.st_dev==ss.st_dev&&ds.st_ino==ss.st_ino)    //same device + inode = same file
+        {                           //start of error case
+            fprintf(stderr,"cp: '%s' and '%s' are the same file\n",argv[i],argv[argc-1]);     //copying would empty it
+            ret=1;                  //remember the failure
+            continue;               //next source
+        }                           //end of error case
+        if(copy_file(src,target,argv[i],argv[argc-1],ss.st_mode)!=0)ret=1;    //do the copy with read()/write()
+    }                               //end of source loop
+    return ret;                     //0 if all were copied
+}                                   //end of cp
 //mv src dst | mv src... dir: rename()
-int mv_call(int argc,char *argv[])
-{
-    char src[PATH_MAX],dst[PATH_MAX],target[PATH_MAX+512];
-    struct stat ss,ds;
-    int i,isdir,ret=0;
-    size_t len;
-    if(argc<3)
-    {
-        fprintf(stderr,"usage: mv <source> <destination>  |  mv <source>... <directory>\n");
-        return 1;
-    }
-    if(fix("mv",argv[argc-1],dst)!=0)return 1;
-    isdir=stat(dst,&ds)==0&&S_ISDIR(ds.st_mode);
-    if(argc>3&&!isdir)
-    {
-        fprintf(stderr,"mv: target '%s' is not a directory\n",argv[argc-1]);
-        return 1;
-    }
-    for(i=1;i<argc-1;i++)
-    {
-        if(fix("mv",argv[i],src)!=0){ret=1;continue;}
-        if(lstat(src,&ss)!=0)
-        {
-            fprintf(stderr,"mv: cannot stat '%s': %s\n",argv[i],strerror(errno));
-            ret=1;
-            continue;
-        }
-        if(strcmp(src,root[0]?root:"/")==0)
-        {
-            fprintf(stderr,"mv: cannot move the root directory\n");
-            ret=1;
-            continue;
-        }
-        if(isdir)snprintf(target,sizeof(target),"%s/%s",dst,base_name(src));
-        else snprintf(target,sizeof(target),"%s",dst);
-        if(jail_check(target)==-2)
-        {
-            fprintf(stderr,"mv: %s: Permission denied (outside root directory)\n",argv[argc-1]);
-            ret=1;
-            continue;
-        }
-        len=strlen(src);
-        if(S_ISDIR(ss.st_mode)&&strncmp(target,src,len)==0&&target[len]=='/')
-        {
-            fprintf(stderr,"mv: cannot move '%s' to a subdirectory of itself\n",argv[i]);
-            ret=1;
-            continue;
-        }
-        if(rename(src,target)!=0)
-        {
-            fprintf(stderr,"mv: cannot move '%s' to '%s': %s\n",argv[i],argv[argc-1],strerror(errno));
-            ret=1;
-        }
-    }
-    return ret;
-}
+int mv_call(int argc,char *argv[])   //mv command
+{                                   //start of mv
+    char src[PATH_MAX],dst[PATH_MAX],target[PATH_MAX+512];     //source, destination, final target path
+    struct stat ss,ds;              //information about source and destination
+    int i,isdir,ret=0;              //counter, "destination is a folder", exit status
+    size_t len;                     //string length helper
+    if(argc<3)                      //need a source and a destination
+    {                               //start of error case
+        fprintf(stderr,"usage: mv <source> <destination>  |  mv <source>... <directory>\n");  //show the usage
+        return 1;                   //failure
+    }                               //end of error case
+    if(expand_path("mv",argv[argc-1],dst)!=0)return 1;     //last argument is the destination
+    isdir=stat(dst,&ds)==0&&S_ISDIR(ds.st_mode);   //system call: is the destination a folder?
+    if(argc>3&&!isdir)              //several sources need a folder
+    {                               //start of error case
+        fprintf(stderr,"mv: target '%s' is not a directory\n",argv[argc-1]);   //report it
+        return 1;                   //failure
+    }                               //end of error case
+    for(i=1;i<argc-1;i++)           //move each source
+    {                               //start of source loop
+        if(expand_path("mv",argv[i],src)!=0){ret=1;continue;}  //handle "~"
+        if(stat(src,&ss)!=0)        //system call: source must exist
+        {                           //start of error case
+            fprintf(stderr,"mv: cannot stat '%s': %s\n",argv[i],strerror(errno));     //e.g. No such file
+            ret=1;                  //remember the failure
+            continue;               //next source
+        }                           //end of error case
+        len=strlen(src);            //length of the source path
+        while(len>1&&src[len-1]=='/')src[--len]='\0';  //drop trailing '/' ("//" becomes "/")
+        if(strcmp(src,"/")==0)      //safety: never move the root folder
+        {                           //start of refuse case
+            fprintf(stderr,"mv: cannot move the root directory\n");    //explain
+            ret=1;                  //failure for this one
+            continue;               //next source
+        }                           //end of refuse case
+        if(isdir)snprintf(target,sizeof(target),"%s/%s",dst,base_name(src));  //into a folder: keep the name
+        else snprintf(target,sizeof(target),"%s",dst);  //otherwise rename to the given name
+        len=strlen(src);            //length for the prefix test
+        if(S_ISDIR(ss.st_mode)&&strncmp(target,src,len)==0&&target[len]=='/')     //target lies inside the folder itself
+        {                           //start of refuse case
+            fprintf(stderr,"mv: cannot move '%s' to a subdirectory of itself\n",argv[i]);     //explain
+            ret=1;                  //failure for this one
+            continue;               //next source
+        }                           //end of refuse case
+        if(rename(src,target)!=0)   //system call: move/rename in one step
+        {                           //start of error case
+            fprintf(stderr,"mv: cannot move '%s' to '%s': %s\n",argv[i],argv[argc-1],strerror(errno));   //report it
+            ret=1;                  //remember the failure
+        }                           //end of error case
+    }                               //end of source loop
+    return ret;                     //0 if all were moved
+}                                   //end of mv
 
 /* ============ 3. File Viewing & Process Inspection Commands ============ */
 
 //read a whole small file into buf with open(), read(), close()
-int read_file(const char *path,char *buf,int size)
-{
-    int fd,total=0;
-    ssize_t n;
-    fd=open(path,O_RDONLY);
-    if(fd<0)return -1;
-    while(total<size-1&&(n=read(fd,buf+total,size-1-total))>0)total+=n;
-    close(fd);
-    buf[total]='\0';
-    return total;
-}
-int cat_fd(int fd,const char *name)
-{
-    char buf[BUF_SIZE];
-    ssize_t n;
-    while((n=read(fd,buf,sizeof(buf)))>0)
-        if(write_all(STDOUT_FILENO,buf,n)!=0)return 1;
-    if(n<0)
-    {
-        fprintf(stderr,"cat: %s: %s\n",name,strerror(errno));
-        return 1;
-    }
-    return 0;
-}
+int read_file(const char *path,char *buf,int size)   //returns bytes read, -1 on error
+{                                   //start of read_file
+    int fd,total=0;                 //file descriptor, bytes read so far
+    ssize_t n;                      //bytes read in one step
+    fd=open(path,O_RDONLY);         //system call: open for reading
+    if(fd<0)return -1;              //cannot open it
+    while(total<size-1&&(n=read(fd,buf+total,size-1-total))>0)total+=n;    //system call: read until full or end of file
+    close(fd);                      //system call: close it
+    buf[total]='\0';                //make it a C string
+    return total;                   //number of bytes read
+}                                   //end of read_file
+int cat_fd(int fd,const char *name) //copy everything from fd to stdout
+{                                   //start of cat_fd
+    char buf[BUF_SIZE];             //copy buffer
+    ssize_t n;                      //bytes read in one step
+    while((n=read(fd,buf,sizeof(buf)))>0)  //system call: read the next block
+        if(write_all(STDOUT_FILENO,buf,n)!=0)return 1;     //system call: write it to stdout
+    if(n<0)                         //read() failed (e.g. a folder: Is a directory)
+    {                               //start of error case
+        fprintf(stderr,"cat: %s: %s\n",name,strerror(errno));     //report it
+        return 1;                   //failure
+    }                               //end of error case
+    return 0;                       //success
+}                                   //end of cat_fd
 //cat [file...]: open(), read(), write(); no file (or "-") reads standard input
-int cat_call(int argc,char *argv[])
-{
-    char real[PATH_MAX];
-    int i,fd,ret=0;
-    if(argc<2)return cat_fd(STDIN_FILENO,"stdin");
-    for(i=1;i<argc;i++)
-    {
-        if(strcmp(argv[i],"-")==0)
-        {
-            ret|=cat_fd(STDIN_FILENO,"stdin");
-            continue;
-        }
-        if(fix("cat",argv[i],real)!=0){ret=1;continue;}
-        fd=open(real,O_RDONLY);
-        if(fd<0)
-        {
-            fprintf(stderr,"cat: %s: %s\n",argv[i],strerror(errno));
-            ret=1;
-            continue;
-        }
-        ret|=cat_fd(fd,argv[i]);
-        close(fd);
-    }
-    return ret;
-}
+int cat_call(int argc,char *argv[])   //cat command
+{                                   //start of cat
+    char real[PATH_MAX];            //path after "~" expansion
+    int i,fd,ret=0;                 //counter, file descriptor, exit status
+    if(argc<2)return cat_fd(STDIN_FILENO,"stdin");    //no file: copy standard input (works with < and pipes)
+    for(i=1;i<argc;i++)             //each file in order
+    {                               //start of file loop
+        if(strcmp(argv[i],"-")==0)  //"-" means standard input
+        {                           //start of stdin case
+            ret|=cat_fd(STDIN_FILENO,"stdin");     //copy stdin
+            continue;               //next argument
+        }                           //end of stdin case
+        if(expand_path("cat",argv[i],real)!=0){ret=1;continue;}    //handle "~"
+        fd=open(real,O_RDONLY);     //system call: open the file
+        if(fd<0)                    //cannot open it
+        {                           //start of error case
+            fprintf(stderr,"cat: %s: %s\n",argv[i],strerror(errno));  //e.g. No such file
+            ret=1;                  //remember the failure
+            continue;               //still print the other files
+        }                           //end of error case
+        ret|=cat_fd(fd,argv[i]);    //print its content
+        close(fd);                  //system call: close it
+    }                               //end of file loop
+    return ret;                     //0 if all files were printed
+}                                   //end of cat
 //echo [-n] text...: builtin ($VAR, ${VAR} and $? are expanded by the parser)
-int echo_call(int argc,char *argv[])
-{
-    int i=1,newline=1;
-    if(argc>1&&strcmp(argv[1],"-n")==0){newline=0;i=2;}
-    for(;i<argc;i++)
-    {
-        fputs(argv[i],stdout);
-        if(i<argc-1)putchar(' ');
-    }
-    if(newline)putchar('\n');
-    fflush(stdout);
-    return 0;
-}
+int echo_call(int argc,char *argv[])   //echo builtin
+{                                   //start of echo
+    int i=1,newline=1;              //first word to print, print a newline at the end?
+    if(argc>1&&strcmp(argv[1],"-n")==0){newline=0;i=2;}   //-n: no newline, skip the option
+    for(;i<argc;i++)                //each word
+    {                               //start of word loop
+        fputs(argv[i],stdout);      //print the word
+        if(i<argc-1)putchar(' ');   //one space between words
+    }                               //end of word loop
+    if(newline)putchar('\n');       //end the line
+    fflush(stdout);                 //write it out now (needed before a redirect is undone)
+    return 0;                       //echo always succeeds
+}                                   //end of echo
 //uptime: /proc/uptime and /proc/loadavg
-int uptime_call(int argc,char *argv[])
-{
-    char buf[256];
-    double up,load1,load5,load15;
-    long total;
-    if(read_file("/proc/uptime",buf,sizeof(buf))<0||sscanf(buf,"%lf",&up)!=1)
-    {
-        perror("uptime: /proc/uptime");
-        return 1;
-    }
-    if(read_file("/proc/loadavg",buf,sizeof(buf))<0||sscanf(buf,"%lf %lf %lf",&load1,&load5,&load15)!=3)
-    {
-        perror("uptime: /proc/loadavg");
-        return 1;
-    }
-    total=(long)up;
-    printf("Uptime       : %ld days, %ld hours, %ld minutes, %ld seconds\n",total/86400,(total%86400)/3600,(total%3600)/60,total%60);
-    printf("Load average : %.2f (1 min), %.2f (5 min), %.2f (15 min)\n",load1,load5,load15);
-    return 0;
-}
+int uptime_call(int argc,char *argv[])   //uptime command
+{                                   //start of uptime
+    char buf[256];                  //file content
+    double up,load1,load5,load15;   //seconds since boot, 1/5/15-minute load averages
+    long total;                     //whole seconds since boot
+    if(read_file("/proc/uptime",buf,sizeof(buf))<0||sscanf(buf,"%lf",&up)!=1)     //first number = seconds since boot
+    {                               //start of error case
+        perror("uptime: /proc/uptime");    //report it
+        return 1;                   //failure
+    }                               //end of error case
+    if(read_file("/proc/loadavg",buf,sizeof(buf))<0||sscanf(buf,"%lf %lf %lf",&load1,&load5,&load15)!=3)   //first three numbers = load averages
+    {                               //start of error case
+        perror("uptime: /proc/loadavg");   //report it
+        return 1;                   //failure
+    }                               //end of error case
+    total=(long)up;                 //drop the fraction of a second
+    printf("Uptime       : %ld days, %ld hours, %ld minutes, %ld seconds\n",total/86400,(total%86400)/3600,(total%3600)/60,total%60);   //split seconds into d/h/m/s
+    printf("Load average : %.2f (1 min), %.2f (5 min), %.2f (15 min)\n",load1,load5,load15);  //CPU load
+    return 0;                       //success
+}                                   //end of uptime
 //meminfo: parse /proc/meminfo
-int meminfo_call(int argc,char *argv[])
-{
-    char buf[8192],name[64],*line,*save;
-    char *wanted[]={"MemTotal","MemFree","MemAvailable","Buffers","Cached","SwapTotal","SwapFree"};
-    long value,total=-1,avail=-1;
-    int i;
-    if(read_file("/proc/meminfo",buf,sizeof(buf))<0)
-    {
-        perror("meminfo: /proc/meminfo");
-        return 1;
-    }
-    for(line=strtok_r(buf,"\n",&save);line!=NULL;line=strtok_r(NULL,"\n",&save))
-    {
+int meminfo_call(int argc,char *argv[])   //meminfo command
+{                                   //start of meminfo
+    char buf[8192],name[64],*line,*save;   //file content, field name, current line, strtok_r state
+    char *wanted[]={"MemTotal","MemFree","MemAvailable","Buffers","Cached","SwapTotal","SwapFree"};    //fields we print
+    long value,total=-1,avail=-1;   //field value in kB, total and available memory
+    int i;                          //counter
+    if(read_file("/proc/meminfo",buf,sizeof(buf))<0)   //read the whole file
+    {                               //start of error case
+        perror("meminfo: /proc/meminfo");  //report it
+        return 1;                   //failure
+    }                               //end of error case
+    for(line=strtok_r(buf,"\n",&save);line!=NULL;line=strtok_r(NULL,"\n",&save))  //go line by line
+    {                               //start of line loop
         if(sscanf(line,"%63[^:]: %ld",name,&value)!=2)continue;    //"MemTotal:   16314772 kB"
-        if(strcmp(name,"MemTotal")==0)total=value;
-        if(strcmp(name,"MemAvailable")==0)avail=value;
-        for(i=0;i<7;i++)
-        {
-            if(strcmp(name,wanted[i])==0)
-            {
-                printf("%-13s: %10ld kB  (%ld MB)\n",name,value,value/1024);
-                break;
-            }
-        }
-    }
-    if(total>=0&&avail>=0)printf("%-13s: %10ld kB  (%ld MB)\n","MemUsed",total-avail,(total-avail)/1024);
-    return 0;
-}
+        if(strcmp(name,"MemTotal")==0)total=value;     //remember total for MemUsed
+        if(strcmp(name,"MemAvailable")==0)avail=value;     //remember available for MemUsed
+        for(i=0;i<7;i++)            //is this one of the wanted fields?
+        {                           //start of field loop
+            if(strcmp(name,wanted[i])==0)  //yes
+            {                       //start of print case
+                printf("%-13s: %10ld kB  (%ld MB)\n",name,value,value/1024);    //print in kB and MB
+                break;              //no need to check further
+            }                       //end of print case
+        }                           //end of field loop
+    }                               //end of line loop
+    if(total>=0&&avail>=0)printf("%-13s: %10ld kB  (%ld MB)\n","MemUsed",total-avail,(total-avail)/1024);   //used = total - available
+    return 0;                       //success
+}                                   //end of meminfo
 
 /* ============ Built-in commands (run inside the shell process) ============ */
 
-//cd [dir | - | ~ | /]: chdir(), never above root
-int cd_call(int argc,char *argv[])
-{
-    char real[PATH_MAX],old[PATH_MAX],back[PATH_MAX];
-    const char *target;
-    struct stat st;
-    int dash=0;
-    if(argc>2)
-    {
-        fprintf(stderr,"cd: too many arguments\n");
-        return 1;
-    }
-    target=argc>1?argv[1]:"/";
-    if(strcmp(target,"-")==0)
-    {
-        snprintf(back,sizeof(back),"%s",virt(prevdir));
-        target=back;
-        dash=1;
-    }
-    if(fix("cd",target,real)!=0)return 1;
-    if(stat(real,&st)!=0)
-    {
-        fprintf(stderr,"cd: %s: %s\n",target,strerror(errno));
-        return 1;
-    }
-    if(!S_ISDIR(st.st_mode))
-    {
-        fprintf(stderr,"cd: %s: Not a directory\n",target);
-        return 1;
-    }
-    if(getcwd(old,sizeof(old))==NULL)old[0]='\0';
-    if(chdir(real)!=0)
-    {
-        fprintf(stderr,"cd: %s: %s\n",target,strerror(errno));
-        return 1;
-    }
-    if(old[0])strcpy(prevdir,old);
-    if(getcwd(real,sizeof(real))!=NULL)
-    {
-        setenv("PWD",show(real),1);
-        if(dash)printf("%s\n",show(real));
-    }
-    return 0;
-}
+//cd [dir | - | ~]: chdir(); getcwd() remembers the old folder for "cd -"
+int cd_call(int argc,char *argv[])   //cd builtin
+{                                   //start of cd
+    char real[PATH_MAX],old[PATH_MAX],back[PATH_MAX];  //target path, folder before cd, copy of prevdir
+    const char *target;             //where to go
+    int dash=0;                     //1 for "cd -" (prints the new folder)
+    if(argc>2)                      //cd takes at most one argument
+    {                               //start of error case
+        fprintf(stderr,"cd: too many arguments\n");    //report it
+        return 1;                   //failure
+    }                               //end of error case
+    if(argc==2&&argv[1][0]=='\0')return 0;     //cd "" stays here, like bash
+    target=argc>1?argv[1]:"~";             //no argument: home folder
+    if(strcmp(target,"-")==0)       //"cd -": go back to the previous folder
+    {                               //start of "cd -" case
+        snprintf(back,sizeof(back),"%s",prevdir);  //copy it, prevdir changes below
+        target=back;                //go there
+        dash=1;                     //print it afterwards
+    }                               //end of "cd -" case
+    if(expand_path("cd",target,real)!=0)return 1;  //handle "~" and "~/x"
+    if(getcwd(old,sizeof(old))==NULL)old[0]='\0';   //system call: remember where we are now
+    if(chdir(real)!=0)          //ENOENT, ENOTDIR ("Not a directory"), EACCES ...
+    {                               //start of error case
+        fprintf(stderr,"cd: %s: %s\n",target,strerror(errno));    //report why
+        return 1;                   //failure, folder unchanged
+    }                               //end of error case
+    if(old[0])strcpy(prevdir,old);  //the old folder becomes the "cd -" target
+    if(dash&&getcwd(real,sizeof(real))!=NULL)printf("%s\n",show_path(real));  //"cd -" prints the new folder
+    return 0;                       //success
+}                                   //end of cd
 //exit [n]: leave the shell with status n (default: status of the last command)
-int exit_call(int argc,char *argv[])
-{
-    char *end;
-    long code=last_status;
-    if(argc>2)
-    {
-        fprintf(stderr,"exit: too many arguments\n");
-        return 1;
-    }
-    if(argc==2)
-    {
-        code=strtol(argv[1],&end,10);
-        if(argv[1][0]=='\0'||*end!='\0')
-        {
-            fprintf(stderr,"exit: %s: numeric argument required\n",argv[1]);
-            code=2;
-        }
-    }
-    fflush(stdout);
-    exit((int)(code&255));
-}
-int help_call(int argc,char *argv[])
-{
-    printf("myshell - custom shell. \"/\" is the folder where myshell was started;\n");
-    printf("no command can reach a path above it (\"cd ..\" at \"/\" is blocked).\n\n");
-    printf("Built-in commands (run inside the shell process):\n");
-    printf("  cd [dir|-|~|/]      change directory (no argument = root)\n");
-    printf("  echo [-n] text      print text ($VAR, ${VAR}, $? are expanded)\n");
-    printf("  exit [n]            leave the shell with status n\n");
-    printf("  help                show this help\n");
-    printf("  history [n]         show history; !! repeats last, !N repeats number N\n\n");
-    printf("Commands run in a child process (fork + waitpid):\n");
-    printf("  pwd                 print current directory\n");
-    printf("  ls [-a] [-l] [path] list a directory\n");
-    printf("  whoami              print user name\n");
-    printf("  uname [-asnrvm]     print system information\n");
-    printf("  mkdir [-p] dir...   create directories (mode 0755)\n");
-    printf("  touch file...       create file / update its time\n");
-    printf("  rm [-r] [-f] path.. remove files or empty directories (-r: everything)\n");
-    printf("  cp src dst          copy a file (dst may be a directory)\n");
-    printf("  mv src dst          move / rename (dst may be a directory)\n");
-    printf("  cat [file...]       print files (no file: standard input)\n");
-    printf("  uptime              system uptime and load average\n");
-    printf("  meminfo             memory statistics\n");
-    printf("Any other command is run with fork + execvp.\n\n");
-    printf("Operators: cmd1 | cmd2   cmd > file   cmd >> file   cmd < file   cmd &\n");
-    printf("Quotes: \"text with $VAR\"  'literal text'  \\x escapes one character\n");
-    return 0;
-}
-void hist_add(const char *line)
-{
-    int k=hist_total%HIST_SIZE;
-    free(history[k]);
-    history[k]=strdup(line);
-    hist_total++;
-}
+int exit_call(int argc,char *argv[])   //exit builtin
+{                                   //start of exit
+    char *end;                      //where number parsing stopped
+    long code=last_status;          //default exit status
+    if(argc>2)                      //at most one argument
+    {                               //start of error case
+        fprintf(stderr,"exit: too many arguments\n");  //report it and stay in the shell
+        return 1;                   //failure
+    }                               //end of error case
+    if(argc==2)                     //an exit status was given
+    {                               //start of number case
+        code=strtol(argv[1],&end,10);   //read it as a decimal number
+        if(argv[1][0]=='\0'||*end!='\0')   //not a whole number
+        {                           //start of error case
+            fprintf(stderr,"exit: %s: numeric argument required\n",argv[1]);  //report it
+            code=2;                 //bash also exits with 2 here
+        }                           //end of error case
+    }                               //end of number case
+    fflush(stdout);                 //write any pending output first
+    exit((int)(code&255));          //end the shell process; status is 0-255
+}                                   //end of exit
+//one help page per command: usage, what it does, and the system calls behind it
+struct {const char *name,*usage,*info,*calls;} help_pages[]={  //table used by "help <command>"
+    {"cd","cd [dir | - | ~ | /]","Change the shell's directory. No argument or ~ = home folder, - = previous folder,\n  .. = parent folder.","chdir(), getcwd() (builtin, runs in the shell process)"},   //cd page
+    {"echo","echo [-n] text...","Print text. $VAR, ${VAR}, $PWD and $? are expanded; -n = no newline.","write() through stdout, getenv() (builtin)"},  //echo page
+    {"exit","exit [n]","Leave the shell with status n (default: status of the last command).","exit() (builtin)"},  //exit page
+    {"help","help [command]","Show the command list, or the help page of one command.","builtin"},     //help page
+    {"history","history [n]","Show the last n commands (all if n is missing).\n  !! runs the last command again, !N runs command number N.","builtin, in-memory list"},    //history page
+    {"pwd","pwd","Print the current directory. Inside the start folder it is shown by\n  that folder's name (e.g. 4_SH_01/demo); above it, the full path.","getcwd()"},   //pwd page
+    {"ls","ls [-a] [-l] [path...]","List a directory. -a shows hidden files, -l the long format.\n  Folders end with /.","opendir(), readdir(), closedir(), stat()"},    //ls page
+    {"whoami","whoami","Print the current user name.","getuid(), getpwuid()"},     //whoami page
+    {"uname","uname [-a -s -n -r -v -m]","Print system name, host, kernel release, version and machine.","uname()"},    //uname page
+    {"mkdir","mkdir [-p] dir...","Create directories with mode 0755. -p creates missing parents too.","mkdir()"},    //mkdir page
+    {"touch","touch file...","Create an empty file, or set the time of an existing one to now.","open(O_CREAT), close(), utimensat()"},   //touch page
+    {"rm","rm [-r] [-f] path...","Remove files and empty directories. -r removes a folder and its contents,\n  -f ignores missing files.","unlink(), rmdir()"},   //rm page
+    {"cp","cp src dst | cp src... dir","Copy files (dst may be a directory). The mode is kept.","open(), read(), write(), close()"},  //cp page
+    {"mv","mv src dst | mv src... dir","Move or rename files and folders.","rename()"},  //mv page
+    {"cat","cat [file...]","Print files. No file (or -) reads standard input.","open(), read(), write(), close()"},  //cat page
+    {"uptime","uptime","Show how long the system has been running and the load average.","open(), read() on /proc/uptime and /proc/loadavg"},     //uptime page
+    {"meminfo","meminfo","Show total, free, available and used memory and swap.","open(), read() on /proc/meminfo"},  //meminfo page
+    {NULL,NULL,NULL,NULL}           //end marker of the table
+};                                  //end of help_pages
+//help [command]: the whole menu, or the page of one command
+int help_call(int argc,char *argv[])   //help builtin
+{                                   //start of help
+    int i,j,ret=0;                  //table index, argument index, exit status
+    if(argc>1)                      //"help ls cp": show those pages
+    {                               //start of page case
+        for(j=1;j<argc;j++)         //each asked command
+        {                           //start of argument loop
+            for(i=0;help_pages[i].name!=NULL&&strcmp(help_pages[i].name,argv[j])!=0;i++);  //search the table
+            if(help_pages[i].name==NULL)   //reached the end marker: not found
+            {                       //start of error case
+                fprintf(stderr,"help: no help topic for '%s'\n",argv[j]);  //report it
+                ret=1;              //remember the failure
+                continue;           //next argument
+            }                       //end of error case
+            printf("%s%s\n  usage : %s\n  %s\n  system calls: %s\n",j>1?"\n":"",help_pages[i].name,help_pages[i].usage,help_pages[i].info,help_pages[i].calls);   //print the page
+        }                           //end of argument loop
+        return ret;                 //0 if all pages were found
+    }                               //end of page case
+    printf("myshell - custom UNIX shell.\n\n");    //menu title
+    printf("Built-in commands (run inside the shell process):\n");     //group: built-ins
+    printf("  cd [dir|-|~|..]     change directory (no argument = home folder)\n");    //cd line
+    printf("  echo [-n] text      print text ($VAR, ${VAR}, $? are expanded)\n");     //echo line
+    printf("  exit [n]            leave the shell with status n\n");  //exit line
+    printf("  help [command]      show this help, or the help of one command\n");     //help line
+    printf("  history [n]         show history; !! repeats last, !N repeats number N\n\n");   //history line
+    printf("File and directory commands (child process: fork + waitpid):\n");  //group: file commands
+    printf("  pwd                 print current directory (start folder shown by its name)\n");    //pwd line
+    printf("  ls [-a] [-l] [path] list a directory\n");     //ls line
+    printf("  mkdir [-p] dir...   create directories (mode 0755)\n");     //mkdir line
+    printf("  touch file...       create file / update its time\n");  //touch line
+    printf("  rm [-r] [-f] path.. remove files or empty directories (-r: everything)\n");  //rm line
+    printf("  cp src dst          copy a file (dst may be a directory)\n");   //cp line
+    printf("  mv src dst          move / rename (dst may be a directory)\n");     //mv line
+    printf("  cat [file...]       print files (no file: standard input)\n\n");    //cat line
+    printf("System information:\n");   //group: system info
+    printf("  whoami              print user name\n");  //whoami line
+    printf("  uname [-asnrvm]     print system information\n");   //uname line
+    printf("  uptime              system uptime and load average\n");     //uptime line
+    printf("  meminfo             memory statistics\n\n");    //meminfo line
+    printf("Any other command is run with fork + execvp (e.g. wc, sort, grep).\n\n");  //external programs
+    printf("Operators: cmd1 | cmd2   cmd > file   cmd >> file   cmd < file   cmd &\n");  //pipes, redirection, background
+    printf("Quotes: \"text with $VAR\"  'literal text'  \\x escapes one character\n");  //quoting rules
+    printf("Keys: Ctrl+C stops the running command, Ctrl+D leaves the shell.\n");  //keyboard keys
+    printf("Type \"help <command>\" for details, e.g. help ls\n");     //how to get a page
+    return 0;                       //success
+}                                   //end of help
+void hist_add(const char *line)     //store one command line in the history ring
+{                                   //start of hist_add
+    int k=hist_total%HIST_SIZE;     //slot to use (oldest entry is overwritten after 100)
+    free(history[k]);               //free the old text in that slot (free(NULL) is fine)
+    history[k]=strdup(line);        //keep a copy of the line
+    hist_total++;                   //one more command in total
+}                                   //end of hist_add
 //history entry number num (1 based), NULL if it does not exist
-const char *hist_get(long num)
-{
-    if(num<1||num>hist_total||num<=hist_total-HIST_SIZE)return NULL;
-    return history[(num-1)%HIST_SIZE];
-}
+const char *hist_get(long num)   //get history entry number num
+{                                   //start of hist_get
+    if(num<1||num>hist_total||num<=hist_total-HIST_SIZE)return NULL;   //out of range or already forgotten
+    return history[(num-1)%HIST_SIZE];     //its slot in the ring
+}                                   //end of hist_get
 //history [n]: list the last commands
-int history_call(int argc,char *argv[])
-{
-    int i,start=hist_total>HIST_SIZE?hist_total-HIST_SIZE:0;
-    long n;
-    char *end;
-    if(argc>2)
-    {
-        fprintf(stderr,"history: too many arguments\n");
-        return 1;
-    }
-    if(argc==2)
-    {
-        n=strtol(argv[1],&end,10);
-        if(argv[1][0]=='\0'||*end!='\0'||n<0)
-        {
-            fprintf(stderr,"history: %s: numeric argument required\n",argv[1]);
-            return 1;
-        }
-        if(hist_total-n>start)start=hist_total-n;
-    }
-    for(i=start;i<hist_total;i++)printf("%5d  %s\n",i+1,history[i%HIST_SIZE]);
-    return 0;
-}
+int history_call(int argc,char *argv[])   //history builtin
+{                                   //start of history
+    int i,start=hist_total>HIST_SIZE?hist_total-HIST_SIZE:0;   //oldest entry still kept
+    long n;                         //how many to show
+    char *end;                      //where number parsing stopped
+    if(argc>2)                      //at most one argument
+    {                               //start of error case
+        fprintf(stderr,"history: too many arguments\n");   //report it
+        return 1;                   //failure
+    }                               //end of error case
+    if(argc==2)                     //"history n"
+    {                               //start of number case
+        n=strtol(argv[1],&end,10);  //read n
+        if(argv[1][0]=='\0'||*end!='\0'||n<0)  //not a whole number >= 0
+        {                           //start of error case
+            fprintf(stderr,"history: %s: numeric argument required\n",argv[1]);   //report it
+            return 1;               //failure
+        }                           //end of error case
+        if(hist_total-n>start)start=hist_total-n;  //show only the last n
+    }                               //end of number case
+    for(i=start;i<hist_total;i++)printf("%5d  %s\n",i+1,history[i%HIST_SIZE]);    //number and command
+    return 0;                       //success
+}                                   //end of history
 
-typedef struct {const char *name;int (*fn)(int,char **);int builtin;} Command;
-Command commands[]={
-    {"cd",cd_call,1},{"echo",echo_call,1},{"exit",exit_call,1},{"help",help_call,1},{"history",history_call,1},
-    {"pwd",pwd_call,0},{"ls",ls_call,0},{"whoami",whoami_call,0},{"uname",uname_call,0},
-    {"mkdir",mkdir_call,0},{"touch",touch_call,0},{"rm",rm_call,0},{"cp",cp_call,0},{"mv",mv_call,0},
-    {"cat",cat_call,0},{"uptime",uptime_call,0},{"meminfo",meminfo_call,0},
-    {NULL,NULL,0}
-};
-Command *find_command(const char *name)
-{
-    int i;
-    for(i=0;commands[i].name!=NULL;i++)
-        if(strcmp(commands[i].name,name)==0)return &commands[i];
-    return NULL;
-}
+typedef struct {const char *name;int (*fn)(int,char **);int builtin;} Command;    //name, function, 1 = runs in the parent
+Command commands[]={                //table of every command written in this file
+    {"cd",cd_call,1},{"echo",echo_call,1},{"exit",exit_call,1},{"help",help_call,1},{"history",history_call,1},   //built-ins: run inside the shell
+    {"pwd",pwd_call,0},{"ls",ls_call,0},{"whoami",whoami_call,0},{"uname",uname_call,0},     //run in a forked child
+    {"mkdir",mkdir_call,0},{"touch",touch_call,0},{"rm",rm_call,0},{"cp",cp_call,0},{"mv",mv_call,0},   //run in a forked child
+    {"cat",cat_call,0},{"uptime",uptime_call,0},{"meminfo",meminfo_call,0},    //run in a forked child
+    {NULL,NULL,0}                   //end marker
+};                                  //end of commands
+Command *find_command(const char *name)    //look a name up in the table
+{                                   //start of find_command
+    int i;                          //table index
+    for(i=0;commands[i].name!=NULL;i++)    //walk the table
+        if(strcmp(commands[i].name,name)==0)return &commands[i];   //found it
+    return NULL;                    //not ours: an external program
+}                                   //end of find_command
 
 /* ============ Command parsing ============ */
 
-enum {T_WORD,T_PIPE,T_IN,T_OUT,T_APPEND,T_BG};
-typedef struct {int type;char *word;} Token;
-typedef struct {char *argv[MAX_ARGS];int argc;char *in,*out;int append;} Cmd;
+enum {T_WORD,T_PIPE,T_IN,T_OUT,T_APPEND,T_BG};     //token kinds: word | < > >> &
+typedef struct {int type;char *word;} Token;   //one token; word is set only for T_WORD
+typedef struct {int type;char *file;} Redir;      //one < > or >> with its file, kept in typed order
+typedef struct {char *argv[MAX_ARGS];int argc;Redir redir[MAX_REDIR];int nredir;} Cmd;  //one command of a pipeline
 char words[WORD_BUF];       //storage for the words of the current line
 
-int add_char(char **wp,char c)
-{
-    if(*wp>=words+WORD_BUF-1)
-    {
-        fprintf(stderr,"myshell: command line too long\n");
-        return -1;
-    }
-    *(*wp)++=c;
-    return 0;
-}
-//$NAME, ${NAME}, $? or $$ at *pp: append its value to the word
-int expand_var(const char **pp,char **wp)
-{
-    const char *p=*pp+1,*val;
-    char name[256],num[32];
-    int k=0;
-    if(*p=='?'){snprintf(num,sizeof(num),"%d",last_status);val=num;p++;}
-    else if(*p=='$'){snprintf(num,sizeof(num),"%d",(int)getpid());val=num;p++;}
-    else if(*p=='{')
-    {
-        p++;
-        while(*p&&*p!='}'&&k<255)name[k++]=*p++;
-        if(*p!='}'||k==0)
-        {
-            fprintf(stderr,"myshell: bad substitution\n");
-            return -1;
-        }
-        p++;
-        name[k]='\0';
-        if(strcmp(name,"?")==0){snprintf(num,sizeof(num),"%d",last_status);val=num;}
-        else val=getenv(name);
-    }
-    else if(isalpha((unsigned char)*p)||*p=='_')
-    {
-        while((isalnum((unsigned char)*p)||*p=='_')&&k<255)name[k++]=*p++;
-        name[k]='\0';
-        val=getenv(name);
-    }
+int add_char(char **wp,char c)      //append one character to the word storage
+{                                   //start of add_char
+    if(*wp>=words+WORD_BUF-1)       //storage is full
+    {                               //start of error case
+        fprintf(stderr,"myshell: command line too long\n");    //report it
+        return -1;                  //failure
+    }                               //end of error case
+    *(*wp)++=c;                     //store the character and move on
+    return 0;                       //success
+}                                   //end of add_char
+//value of variable name: $PWD comes from getcwd(), the rest from the environment
+const char *var_value(const char *name)   //value of one shell variable
+{                                   //start of var_value
+    static char cwd[PATH_MAX];      //static so the pointer stays valid after return
+    if(strcmp(name,"PWD")==0)return getcwd(cwd,sizeof(cwd))?show_path(cwd):NULL;   //$PWD is the current folder, shown like pwd
+    return getenv(name);            //any other variable, e.g. $HOME, $PATH
+}                                   //end of var_value
+//$NAME, ${NAME} or $? at *pp: append its value to the word
+int expand_var(const char **pp,char **wp)   //expand one $ variable
+{                                   //start of expand_var
+    const char *p=*pp+1,*val;       //p: character after '$'; val: the value to insert
+    char name[256],num[32];         //variable name, number text for $?
+    int k=0;                        //length of the name
+    if(*p=='?'){snprintf(num,sizeof(num),"%d",last_status);val=num;p++;}  //$?: last exit status
+    else if(*p=='{')                //${NAME}
+    {                               //start of ${NAME} case
+        p++;                        //skip '{'
+        while(*p&&*p!='}'&&k<255)name[k++]=*p++;   //copy the name up to '}'
+        if(*p!='}'||k==0)           //no closing '}' or empty name
+        {                           //start of error case
+            fprintf(stderr,"myshell: bad substitution\n");     //report it
+            return -1;              //failure
+        }                           //end of error case
+        p++;                        //skip '}'
+        name[k]='\0';               //end the name
+        if(strcmp(name,"?")==0){snprintf(num,sizeof(num),"%d",last_status);val=num;}  //${?}
+        else val=var_value(name);   //look the variable up
+    }                               //end of ${NAME} case
+    else if(isalpha((unsigned char)*p)||*p=='_')   //$NAME: starts with a letter or '_'
+    {                               //start of $NAME case
+        while((isalnum((unsigned char)*p)||*p=='_')&&k<255)name[k++]=*p++;    //copy letters, digits, '_'
+        name[k]='\0';               //end the name
+        val=var_value(name);        //look the variable up
+    }                               //end of $NAME case
     else val="$";               //a lone "$" stays as it is
-    *pp=p;
-    if(val==NULL)val="";
-    for(;*val;val++)if(add_char(wp,*val))return -1;
-    return 0;
-}
+    *pp=p;                          //tell the caller where the variable ended
+    if(val==NULL)val="";            //unset variable: empty text
+    for(;*val;val++)if(add_char(wp,*val))return -1;    //copy the value into the word
+    return 0;                       //success
+}                                   //end of expand_var
 //split a line into words and the operators | < > >> &
-int tokenize(const char *p,Token *tok,int *ntok)
-{
-    char *wp=words,*start;
-    int n=0,quoted;
-    while(1)
-    {
-        while(*p==' '||*p=='\t'||*p=='\r'||*p=='\n')p++;
+int tokenize(const char *p,Token *tok,int *ntok)   //line -> tokens
+{                                   //start of tokenize
+    char *wp=words,*start;          //wp: next free spot in words; start: beginning of this word
+    int n=0,quoted;                 //token count; did this word contain quotes?
+    while(1)                        //one token per round
+    {                               //start of token loop
+        while(*p==' '||*p=='\t'||*p=='\r'||*p=='\n')p++;   //skip spaces between tokens
         if(*p=='\0'||*p=='#')break;                 //end of line or comment
-        if(n>=MAX_TOKENS)
-        {
-            fprintf(stderr,"myshell: too many arguments\n");
-            return -1;
-        }
-        if(*p=='|'){tok[n++].type=T_PIPE;p++;continue;}
-        if(*p=='<'){tok[n++].type=T_IN;p++;continue;}
-        if(*p=='&'){tok[n++].type=T_BG;p++;continue;}
-        if(*p=='>')
-        {
-            if(p[1]=='>'){tok[n++].type=T_APPEND;p+=2;}
-            else{tok[n++].type=T_OUT;p++;}
-            continue;
-        }
-        start=wp;
-        quoted=0;
-        while(*p&&!strchr(" \t\r\n|<>&",*p))
-        {
+        if(n>=MAX_TOKENS)           //too many tokens
+        {                           //start of error case
+            fprintf(stderr,"myshell: too many arguments\n");   //report it
+            return -1;              //failure
+        }                           //end of error case
+        if(*p=='|'){tok[n++].type=T_PIPE;p++;continue;}    //pipe operator
+        if(*p=='<'){tok[n++].type=T_IN;p++;continue;}  //input redirection
+        if(*p=='&'){tok[n++].type=T_BG;p++;continue;}  //background operator
+        if(*p=='>')                 //output redirection: > or >>
+        {                           //start of '>' case
+            if(p[1]=='>'){tok[n++].type=T_APPEND;p+=2;}    //">>" appends
+            else{tok[n++].type=T_OUT;p++;}  //">" truncates
+            continue;               //next token
+        }                           //end of '>' case
+        start=wp;                   //a word begins here
+        quoted=0;                   //no quotes seen yet
+        while(*p&&!strchr(" \t\r\n|<>&",*p))   //a word ends at a space or an operator
+        {                           //start of word loop
             if(*p=='\'')            //'single quotes': everything literal
-            {
-                quoted=1;
-                p++;
-                while(*p&&*p!='\'')if(add_char(&wp,*p++))return -1;
-                if(*p!='\'')
-                {
-                    fprintf(stderr,"myshell: syntax error: unterminated quote\n");
-                    return -1;
-                }
-                p++;
-            }
+            {                       //start of single-quote case
+                quoted=1;           //the word had quotes (so "" still counts as a word)
+                p++;                //skip the opening quote
+                while(*p&&*p!='\'')if(add_char(&wp,*p++))return -1;    //copy everything up to the closing quote
+                if(*p!='\'')        //line ended without a closing quote
+                {                   //start of error case
+                    fprintf(stderr,"myshell: syntax error: unterminated quote\n");     //report it
+                    return -1;      //failure
+                }                   //end of error case
+                p++;                //skip the closing quote
+            }                       //end of single-quote case
             else if(*p=='"')        //"double quotes": only $ and \ are special
-            {
-                quoted=1;
-                p++;
-                while(*p&&*p!='"')
-                {
-                    if(*p=='\\'&&p[1]&&strchr("\"\\$",p[1])){p++;if(add_char(&wp,*p++))return -1;}
-                    else if(*p=='$'){if(expand_var(&p,&wp))return -1;}
-                    else if(add_char(&wp,*p++))return -1;
-                }
-                if(*p!='"')
-                {
-                    fprintf(stderr,"myshell: syntax error: unterminated quote\n");
-                    return -1;
-                }
-                p++;
-            }
-            else if(*p=='\\')
-            {
-                p++;
-                if(*p&&add_char(&wp,*p++))return -1;
-            }
-            else if(*p=='$'){if(expand_var(&p,&wp))return -1;}
-            else if(add_char(&wp,*p++))return -1;
-        }
+            {                       //start of double-quote case
+                quoted=1;           //the word had quotes
+                p++;                //skip the opening quote
+                while(*p&&*p!='"')  //up to the closing quote
+                {                   //start of inner loop
+                    if(*p=='\\'&&p[1]&&strchr("\"\\$",p[1])){p++;if(add_char(&wp,*p++))return -1;}   //\" \\ \$ give the plain character
+                    else if(*p=='$'){if(expand_var(&p,&wp))return -1;}     //variables are expanded inside "..."
+                    else if(add_char(&wp,*p++))return -1;  //any other character is copied
+                }                   //end of inner loop
+                if(*p!='"')         //line ended without a closing quote
+                {                   //start of error case
+                    fprintf(stderr,"myshell: syntax error: unterminated quote\n");     //report it
+                    return -1;      //failure
+                }                   //end of error case
+                p++;                //skip the closing quote
+            }                       //end of double-quote case
+            else if(*p=='\\')       //backslash outside quotes
+            {                       //start of backslash case
+                p++;                //skip the backslash
+                if(*p&&add_char(&wp,*p++))return -1;   //next character is taken literally
+            }                       //end of backslash case
+            else if(*p=='$'){if(expand_var(&p,&wp))return -1;}     //$VAR outside quotes
+            else if(add_char(&wp,*p++))return -1;  //an ordinary character
+        }                           //end of word loop
         if(wp==start&&!quoted)continue;            //unset $VAR expands to nothing
-        if(add_char(&wp,'\0'))return -1;
-        tok[n].type=T_WORD;
-        tok[n++].word=start;
-    }
-    *ntok=n;
-    return 0;
-}
-const char *token_name(Token *tok,int i,int ntok)
-{
-    const char *names[]={"word","|","<",">",">>","&"};
-    return i>=ntok?"newline":names[tok[i].type];
-}
+        if(add_char(&wp,'\0'))return -1;   //end the word string
+        tok[n].type=T_WORD;         //it is a word token
+        tok[n++].word=start;        //pointing into the words storage
+    }                               //end of token loop
+    *ntok=n;                        //tell the caller how many tokens
+    return 0;                       //success
+}                                   //end of tokenize
+const char *token_name(Token *tok,int i,int ntok)  //text of token i for error messages
+{                                   //start of token_name
+    const char *names[]={"word","|","<",">",">>","&"};     //one name per token kind
+    return i>=ntok?"newline":names[tok[i].type];   //past the end means "newline", like bash
+}                                   //end of token_name
 //group the tokens into commands connected by pipes
-int parse(Token *tok,int ntok,Cmd *cmd,int *ncmd,int *bg)
-{
-    int i,n=0;
-    Cmd *c=&cmd[0];
-    *bg=0;
-    *ncmd=0;
-    memset(c,0,sizeof(Cmd));
-    for(i=0;i<ntok;i++)
-    {
-        switch(tok[i].type)
-        {
-        case T_WORD:
-            if(c->argc>=MAX_ARGS-1)
-            {
-                fprintf(stderr,"myshell: too many arguments (max %d)\n",MAX_ARGS-1);
-                return -1;
-            }
-            c->argv[c->argc++]=tok[i].word;
-            break;
-        case T_PIPE:
-            if(c->argc==0)
-            {
-                fprintf(stderr,"myshell: syntax error near unexpected token `|'\n");
-                return -1;
-            }
-            if(n+1>=MAX_CMDS)
-            {
-                fprintf(stderr,"myshell: too many pipes (max %d commands)\n",MAX_CMDS);
-                return -1;
-            }
-            c=&cmd[++n];
-            memset(c,0,sizeof(Cmd));
-            break;
-        case T_BG:
-            if(i!=ntok-1||c->argc==0)
-            {
-                fprintf(stderr,"myshell: syntax error near unexpected token `&'\n");
-                return -1;
-            }
-            *bg=1;
-            break;
+int parse(Token *tok,int ntok,Cmd *cmd,int *ncmd,int *bg)   //tokens -> pipeline of commands
+{                                   //start of parse
+    int i,n=0;                      //token index, index of the current command
+    Cmd *c=&cmd[0];                 //command being filled
+    *bg=0;                          //not a background job yet
+    *ncmd=0;                        //no commands yet
+    memset(c,0,sizeof(Cmd));        //start with an empty command
+    for(i=0;i<ntok;i++)             //each token
+    {                               //start of token loop
+        switch(tok[i].type)         //act on its kind
+        {                           //start of switch
+        case T_WORD:                //a word: add it to argv
+            if(c->argc>=MAX_ARGS-1) //keep one slot for the NULL end
+            {                       //start of error case
+                fprintf(stderr,"myshell: too many arguments (max %d)\n",MAX_ARGS-1);   //report it
+                return -1;          //failure
+            }                       //end of error case
+            c->argv[c->argc++]=tok[i].word;    //store the word
+            break;                  //next token
+        case T_PIPE:                //'|': start the next command
+            if(c->argc==0)          //"| ls" or "ls | | cat": nothing before the pipe
+            {                       //start of error case
+                fprintf(stderr,"myshell: syntax error near unexpected token `|'\n");   //report it
+                return -1;          //failure
+            }                       //end of error case
+            if(n+1>=MAX_CMDS)       //pipeline too long
+            {                       //start of error case
+                fprintf(stderr,"myshell: too many pipes (max %d commands)\n",MAX_CMDS);    //report it
+                return -1;          //failure
+            }                       //end of error case
+            c=&cmd[++n];            //move to the next command
+            memset(c,0,sizeof(Cmd));    //and empty it
+            break;                  //next token
+        case T_BG:                  //'&': run in the background
+            if(i!=ntok-1||c->argc==0)  //must be last and follow a command
+            {                       //start of error case
+                fprintf(stderr,"myshell: syntax error near unexpected token `&'\n");   //report it
+                return -1;          //failure
+            }                       //end of error case
+            *bg=1;                  //mark the line as a background job
+            break;                  //next token
         default:        //< > >>
-            if(i+1>=ntok||tok[i+1].type!=T_WORD)
-            {
-                fprintf(stderr,"myshell: syntax error near unexpected token `%s'\n",token_name(tok,i+1,ntok));
-                return -1;
-            }
-            if(tok[i].type==T_IN)c->in=tok[i+1].word;
-            else
-            {
-                c->out=tok[i+1].word;
-                c->append=tok[i].type==T_APPEND;
-            }
-            i++;
-        }
-    }
-    if(c->argc==0)
-    {
-        if(n==0&&c->in==NULL&&c->out==NULL)return 0;       //empty line
-        fprintf(stderr,"myshell: syntax error: missing command\n");
-        return -1;
-    }
-    for(i=0;i<=n;i++)cmd[i].argv[cmd[i].argc]=NULL;
-    *ncmd=n+1;
-    return 0;
-}
+            if(i+1>=ntok||tok[i+1].type!=T_WORD)   //a file name must follow
+            {                       //start of error case
+                fprintf(stderr,"myshell: syntax error near unexpected token `%s'\n",token_name(tok,i+1,ntok));     //e.g. `newline'
+                return -1;          //failure
+            }                       //end of error case
+            if(c->nredir>=MAX_REDIR)   //too many redirections on one command
+            {                       //start of error case
+                fprintf(stderr,"myshell: too many redirections (max %d)\n",MAX_REDIR);     //report it
+                return -1;          //failure
+            }                       //end of error case
+            c->redir[c->nredir].type=tok[i].type;  //remember the kind (< > >>)
+            c->redir[c->nredir++].file=tok[i+1].word;  //and the file name
+            i++;                    //the file name is used up
+        }                           //end of switch
+    }                               //end of token loop
+    if(c->argc==0)                  //last command has no words
+    {                               //start of empty case
+        if(n==0&&c->nredir==0)return 0;        //empty line
+        fprintf(stderr,"myshell: syntax error: missing command\n");    //e.g. "ls |"
+        return -1;                  //failure
+    }                               //end of empty case
+    for(i=0;i<=n;i++)cmd[i].argv[cmd[i].argc]=NULL;    //execvp() needs a NULL at the end of argv
+    *ncmd=n+1;                      //number of commands in the pipeline
+    return 0;                       //success
+}                                   //end of parse
 
 /* ============ Process control ============ */
 
-//< > >>: open() the file inside root and dup2() it onto stdin / stdout
-int redirect(Cmd *c)
-{
-    char real[PATH_MAX];
-    int fd;
-    if(c->in)
-    {
-        if(fix("myshell",c->in,real)!=0)return -1;
-        fd=open(real,O_RDONLY);
-        if(fd<0)
-        {
-            fprintf(stderr,"myshell: %s: %s\n",c->in,strerror(errno));
-            return -1;
-        }
-        dup2(fd,STDIN_FILENO);
-        close(fd);
-    }
-    if(c->out)
-    {
-        if(fix("myshell",c->out,real)!=0)return -1;
-        fd=open(real,O_WRONLY|O_CREAT|(c->append?O_APPEND:O_TRUNC),0644);
-        if(fd<0)
-        {
-            fprintf(stderr,"myshell: %s: %s\n",c->out,strerror(errno));
-            return -1;
-        }
-        dup2(fd,STDOUT_FILENO);
-        close(fd);
-    }
-    return 0;
-}
-//external programs: block path arguments outside root, map "/x" and "~/x" to the real path
-int jail_args(char *argv[])
-{
-    static char conv[MAX_ARGS][PATH_MAX];
-    char *a;
-    int i;
-    if(strchr(argv[0],'/')&&argv[0][0]!='/'&&fix("myshell",argv[0],conv[0])!=0)return -1;
-    for(i=1;argv[i]!=NULL;i++)
-    {
-        a=argv[i];
-        if(a[0]=='-')continue;
-        if(a[0]=='/'||a[0]=='~'||strcmp(a,"..")==0||strncmp(a,"../",3)==0||strstr(a,"/..")!=NULL)
-        {
-            if(fix(argv[0],a,conv[i])!=0)return -1;
-            if(a[0]=='/'||a[0]=='~')argv[i]=conv[i];
-        }
-    }
-    return 0;
-}
+//< > >>: open() the file and dup2() it onto stdin / stdout
+int redirect(Cmd *c)   //apply all redirections of one command
+{                                   //start of redirect
+    char real[PATH_MAX];            //file path after "~" expansion
+    int i,fd,flags;                 //counter, file descriptor, open() flags
+    Redir *r;                       //current redirection
+    for(i=0;i<c->nredir;i++)        //in typed order, like bash: "> a > b" creates a, output goes to b
+    {                               //start of redirection loop
+        r=&c->redir[i];             //this redirection
+        if(expand_path("myshell",r->file,real)!=0)return -1;   //handle "~"
+        if(r->type==T_IN)flags=O_RDONLY;   //'<' reads the file
+        else flags=O_WRONLY|O_CREAT|(r->type==T_APPEND?O_APPEND:O_TRUNC);  //'>' empties it, '>>' adds to the end
+        fd=open(real,flags,0644);   //system call: open (new files get mode 644)
+        if(fd<0)                    //cannot open it
+        {                           //start of error case
+            fprintf(stderr,"myshell: %s: %s\n",r->file,strerror(errno));  //e.g. No such file, Permission denied
+            return -1;              //the command will not run
+        }                           //end of error case
+        dup2(fd,r->type==T_IN?STDIN_FILENO:STDOUT_FILENO);     //system call: put the file on fd 0 or fd 1
+        close(fd);                  //system call: the original fd is no longer needed
+    }                               //end of redirection loop
+    return 0;                       //success
+}                                   //end of redirect
 //inside a child: run our own command, or exec the program
-void child_run(Cmd *c)
-{
-    Command *b=find_command(c->argv[0]);
-    int r;
-    if(redirect(c)!=0)_exit(1);
-    if(b!=NULL)
-    {
-        r=b->fn(c->argc,c->argv);
-        fflush(stdout);
-        _exit(r);
-    }
-    if(jail_args(c->argv)!=0)_exit(1);
-    execvp(c->argv[0],c->argv);
-    if(errno==ENOENT)fprintf(stderr,"%s: command not found\n",c->argv[0]);
-    else fprintf(stderr,"%s: %s\n",c->argv[0],strerror(errno));
-    _exit(errno==ENOENT?127:126);
-}
-int exit_code(int status)
-{
-    if(WIFEXITED(status))return WEXITSTATUS(status);
-    if(WIFSIGNALED(status))return 128+WTERMSIG(status);
-    return 1;
-}
+void child_run(Cmd *c)   //runs in the forked child, never returns
+{                                   //start of child_run
+    Command *b=find_command(c->argv[0]);   //is it one of our commands?
+    int r;                          //its exit status
+    if(redirect(c)!=0)_exit(1);     //set up < > >>; on error the child ends with 1
+    if(b!=NULL)                     //our own command (ls, cp, help in a pipe, ...)
+    {                               //start of own-command case
+        r=b->fn(c->argc,c->argv);   //run it in this child
+        fflush(stdout);             //write its output before leaving
+        _exit(r);                   //end the child with its status
+    }                               //end of own-command case
+    execvp(c->argv[0],c->argv);     //system call: replace this child with the program (searches PATH)
+    if(errno==ENOENT)fprintf(stderr,"%s: command not found\n",c->argv[0]);     //only reached if execvp failed
+    else fprintf(stderr,"%s: %s\n",c->argv[0],strerror(errno));   //e.g. Permission denied
+    _exit(errno==ENOENT?127:126);   //127 = not found, 126 = cannot run (like bash)
+}                                   //end of child_run
+int exit_code(int status)           //turn a waitpid() status into a shell exit status
+{                                   //start of exit_code
+    if(WIFEXITED(status))return WEXITSTATUS(status);   //normal exit: its status
+    if(WIFSIGNALED(status))return 128+WTERMSIG(status);    //killed by signal n: 128+n
+    return 1;                       //anything else counts as failure
+}                                   //end of exit_code
 //run cmd[0] | cmd[1] | ... with pipe(), fork(), dup2(), waitpid()
-int execute(Cmd *cmd,int n,int bg)
-{
-    pid_t pids[MAX_CMDS],pid;
-    int i,j,pfd[2],prev=-1,status=0,saved_in,saved_out,r=1,fd;
-    Command *b=find_command(cmd[0].argv[0]);
+int execute(Cmd *cmd,int n,int bg)   //run a parsed line; returns its exit status
+{                                   //start of execute
+    pid_t pids[MAX_CMDS],pid;       //pid of each child, pid from fork()
+    int i,j,pfd[2],prev=-1,status=0,r=1,fd;    //counters, pipe ends, read end of the previous pipe, wait status, result, fd
+    Command *b=find_command(cmd[0].argv[0]);   //is the first command one of ours?
     if(n==1&&!bg&&b!=NULL&&b->builtin)       //builtin: no child process
-    {
-        fflush(stdout);
-        saved_in=dup(STDIN_FILENO);
-        saved_out=dup(STDOUT_FILENO);
-        if(redirect(&cmd[0])==0)r=b->fn(cmd[0].argc,cmd[0].argv);
-        fflush(stdout);
-        dup2(saved_in,STDIN_FILENO);
-        dup2(saved_out,STDOUT_FILENO);
-        close(saved_in);
-        close(saved_out);
-        return r;
-    }
-    for(i=0;i<n;i++)
-    {
-        if(i<n-1&&pipe(pfd)!=0)
-        {
-            perror("myshell: pipe");
-            break;
-        }
-        fflush(stdout);
-        pid=fork();
-        if(pid<0)
-        {
-            perror("myshell: fork");
-            if(i<n-1){close(pfd[0]);close(pfd[1]);}
-            break;
-        }
-        if(pid==0)
-        {
-            signal(SIGINT,bg?SIG_IGN:SIG_DFL);
-            if(prev!=-1)
-            {
-                dup2(prev,STDIN_FILENO);
-                close(prev);
-            }
+    {                               //start of builtin case
+        fflush(stdout);             //write pending output before fds change
+        dup2(STDIN_FILENO,SAVED_IN);        //keep the terminal on spare fds while redirected
+        dup2(STDOUT_FILENO,SAVED_OUT);     //system call: save stdout too
+        if(redirect(&cmd[0])==0)r=b->fn(cmd[0].argc,cmd[0].argv);  //apply < > >> and run it in the shell itself
+        fflush(stdout);             //write its output into the redirected file
+        dup2(SAVED_IN,STDIN_FILENO);   //system call: give stdin back
+        dup2(SAVED_OUT,STDOUT_FILENO); //system call: give stdout back
+        close(SAVED_IN);            //system call: spare fd no longer needed
+        close(SAVED_OUT);           //system call: spare fd no longer needed
+        return r;                   //status of the builtin
+    }                               //end of builtin case
+    for(i=0;i<n;i++)                //start one child per command
+    {                               //start of fork loop
+        if(i<n-1&&pipe(pfd)!=0)     //system call: a pipe to the next command (not after the last)
+        {                           //start of error case
+            perror("myshell: pipe");   //report it
+            break;                  //stop starting commands
+        }                           //end of error case
+        fflush(stdout);             //so the child does not inherit unwritten output
+        pid=fork();                 //system call: create a child process
+        if(pid<0)                   //fork failed
+        {                           //start of error case
+            perror("myshell: fork");   //report it
+            if(i<n-1){close(pfd[0]);close(pfd[1]);}    //close the unused pipe
+            break;                  //stop starting commands
+        }                           //end of error case
+        if(pid==0)                  //this is the child
+        {                           //start of child code
+            signal(SIGINT,bg?SIG_IGN:SIG_DFL);     //foreground: Ctrl+C kills it; background: ignores Ctrl+C
+            if(prev!=-1)            //not the first command: read from the previous pipe
+            {                       //start of pipe-input case
+                dup2(prev,STDIN_FILENO);   //system call: pipe read end becomes stdin
+                close(prev);        //original fd no longer needed
+            }                       //end of pipe-input case
             else if(bg&&(fd=open("/dev/null",O_RDONLY))>=0)   //background jobs never read the terminal
-            {
-                dup2(fd,STDIN_FILENO);
-                close(fd);
-            }
-            if(i<n-1)
-            {
-                close(pfd[0]);
-                dup2(pfd[1],STDOUT_FILENO);
-                close(pfd[1]);
-            }
-            child_run(&cmd[i]);
-        }
-        pids[i]=pid;
-        if(prev!=-1){close(prev);prev=-1;}
-        if(i<n-1)
-        {
-            close(pfd[1]);
-            prev=pfd[0];
-        }
-    }
-    if(prev!=-1)close(prev);
-    if(i==0)return 1;
-    if(bg)
-    {
-        for(j=0;j<MAX_JOBS&&jobs[j].pid!=0;j++);
-        if(j<MAX_JOBS)
-        {
-            jobs[j].pid=pids[i-1];
-            jobs[j].num=++job_count;
-            snprintf(jobs[j].name,sizeof(jobs[j].name),"%s",cmd[0].argv[0]);
-        }
-        printf("[%d] %d\n",job_count,(int)pids[i-1]);
-        return 0;
-    }
-    for(j=0;j<i;j++)
-    {
-        while(waitpid(pids[j],&status,0)<0&&errno==EINTR);
-        if(j==i-1)r=exit_code(status);
-    }
-    return i<n?1:r;
-}
+            {                       //start of /dev/null case
+                dup2(fd,STDIN_FILENO);     //system call: stdin = /dev/null
+                close(fd);          //original fd no longer needed
+            }                       //end of /dev/null case
+            if(i<n-1)               //not the last command: write into the pipe
+            {                       //start of pipe-output case
+                close(pfd[0]);      //the child does not read its own pipe
+                dup2(pfd[1],STDOUT_FILENO);    //system call: pipe write end becomes stdout
+                close(pfd[1]);      //original fd no longer needed
+            }                       //end of pipe-output case
+            child_run(&cmd[i]);     //run the command (never returns)
+        }                           //end of child code
+        pids[i]=pid;                //parent: remember the child
+        if(prev!=-1){close(prev);prev=-1;}     //parent closes the old read end (the child has it)
+        if(i<n-1)                   //a new pipe was made
+        {                           //start of pipe bookkeeping
+            close(pfd[1]);          //parent never writes into it
+            prev=pfd[0];            //its read end goes to the next command
+        }                           //end of pipe bookkeeping
+    }                               //end of fork loop
+    if(prev!=-1)close(prev);        //close a read end left over after an error
+    if(i==0)return 1;               //no child was started at all
+    if(bg)                          //background: do not wait
+    {                               //start of background case
+        for(j=0;j<MAX_JOBS&&jobs[j].pid!=0;j++);   //find a free job slot
+        if(j<MAX_JOBS)              //a slot is free
+        {                           //start of slot case
+            jobs[j].pid=pids[i-1];  //watch the last command of the pipeline
+            jobs[j].num=++job_count;   //give it the next job number
+            snprintf(jobs[j].name,sizeof(jobs[j].name),"%s",cmd[0].argv[0]);  //name shown in "Done"
+        }                           //end of slot case
+        printf("[%d] %d\n",job_count,(int)pids[i-1]);  //"[1] 12345", like bash
+        return 0;                   //the shell continues at once
+    }                               //end of background case
+    for(j=0;j<i;j++)                //foreground: wait for every child
+    {                               //start of wait loop
+        while(waitpid(pids[j],&status,0)<0&&errno==EINTR);     //system call: wait; retry if Ctrl+C interrupted it
+        if(j==i-1)r=exit_code(status);     //the last command decides the status
+    }                               //end of wait loop
+    if(WIFSIGNALED(status)&&WTERMSIG(status)==SIGINT)printf("\n");  //stopped by Ctrl+C: next prompt on a new line, like bash
+    return i<n?1:r;                 //1 if not all commands could start
+}                                   //end of execute
 //collect finished background jobs: waitpid() with WNOHANG
-void reap_jobs(void)
-{
-    pid_t pid;
-    int status,j;
-    while((pid=waitpid(-1,&status,WNOHANG))>0)
-    {
-        for(j=0;j<MAX_JOBS;j++)
-        {
-            if(jobs[j].pid!=pid)continue;
-            printf("[%d] Done (status %d)    %s\n",jobs[j].num,exit_code(status),jobs[j].name);
-            jobs[j].pid=0;
-            break;
-        }
-    }
-    fflush(stdout);
-}
+void reap_jobs(void)   //report finished background jobs
+{                                   //start of reap_jobs
+    pid_t pid;                      //a finished child
+    int status,j;                   //its status, job slot index
+    while((pid=waitpid(-1,&status,WNOHANG))>0)     //system call: any finished child? (does not block)
+    {                               //start of reap loop
+        for(j=0;j<MAX_JOBS;j++)     //is it one of our jobs?
+        {                           //start of job loop
+            if(jobs[j].pid!=pid)continue;  //not this slot
+            printf("[%d] Done (status %d)    %s\n",jobs[j].num,exit_code(status),jobs[j].name);   //report it
+            jobs[j].pid=0;          //free the slot
+            break;                  //found it
+        }                           //end of job loop
+    }                               //end of reap loop
+    fflush(stdout);                 //show the messages now
+}                                   //end of reap_jobs
 //a line starting with !! or !N is replaced by that history entry
-int hist_expand(char *line)
-{
-    char tmp[MAX_LINE];
-    const char *h;
-    char *p=line,*rest;
-    long num;
-    while(*p==' '||*p=='\t')p++;
-    if(p[0]!='!')return 0;
-    if(p[1]=='!'){h=hist_get(hist_total);rest=p+2;}
-    else if(isdigit((unsigned char)p[1])){num=strtol(p+1,&rest,10);h=hist_get(num);}
-    else return 0;
-    if(h==NULL)
-    {
-        fprintf(stderr,"myshell: %.*s: event not found\n",(int)(rest-p),p);
-        return -1;
-    }
-    if(strlen(h)+strlen(rest)>=MAX_LINE)
-    {
-        fprintf(stderr,"myshell: command line too long\n");
-        return -1;
-    }
-    snprintf(tmp,sizeof(tmp),"%s%s",h,rest);
-    strcpy(line,tmp);
+int hist_expand(char *line)   //replace !! / !N in the line
+{                                   //start of hist_expand
+    char tmp[MAX_LINE];             //the new line being built
+    const char *h;                  //history entry to use
+    char *p=line,*rest;             //p: first non-space; rest: text after !! or !N
+    long num;                       //N of !N
+    while(*p==' '||*p=='\t')p++;    //skip leading spaces
+    if(p[0]!='!')return 0;          //not a history command: nothing to do
+    if(p[1]=='!'){h=hist_get(hist_total);rest=p+2;}    //!!: the last command
+    else if(isdigit((unsigned char)p[1])){num=strtol(p+1,&rest,10);h=hist_get(num);}  //!N: command number N
+    else return 0;                  //a '!' followed by anything else is left alone
+    if(h==NULL)                     //no such entry
+    {                               //start of error case
+        fprintf(stderr,"myshell: %.*s: event not found\n",(int)(rest-p),p);   //e.g. "!99: event not found"
+        return -1;                  //failure
+    }                               //end of error case
+    if(strlen(h)+strlen(rest)>=MAX_LINE)   //result would not fit in the line buffer
+    {                               //start of error case
+        fprintf(stderr,"myshell: command line too long\n");    //report it
+        return -1;                  //failure
+    }                               //end of error case
+    snprintf(tmp,sizeof(tmp),"%s%s",h,rest);   //old command + anything typed after !N
+    strcpy(line,tmp);               //replace the line
     printf("%s\n",line);        //show the command that will run
-    return 1;
-}
-void on_sigint(int sig)
-{
-    ssize_t r=write(STDOUT_FILENO,"\n",1);
-    (void)r;
-    (void)sig;
-}
+    return 1;                       //the line was replaced
+}                                   //end of hist_expand
+void on_sigint(int sig)             //runs when Ctrl+C reaches the shell
+{                                   //start of on_sigint
+    ssize_t r=0;                    //result of write()
+    if(at_prompt)r=write(STDOUT_FILENO,"\n",1);    //only at our own prompt: move to a new line (a running command prints its own)
+    (void)r;                        //result not needed
+    (void)sig;                      //signal number not needed
+}                                   //end of on_sigint
 
 /* ============ Main loop ============ */
 
-int main(void)
-{
-    char line[MAX_LINE],cwd[PATH_MAX];
-    Token tok[MAX_TOKENS];
-    Cmd cmd[MAX_CMDS];
-    int ntok,ncmd,bg,ch,interactive=isatty(STDIN_FILENO);
-    struct sigaction sa;
-    if(getcwd(root,sizeof(root))==NULL)
-    {
-        perror("myshell: getcwd");
-        return 1;
-    }
-    strcpy(prevdir,root);
-    if(strcmp(root,"/")==0)root[0]='\0';
-    rootlen=strlen(root);
-    setenv("PWD",show(rootlen?root:"/"),1);
-    memset(&sa,0,sizeof(sa));
+int main(void)                      //program start
+{                                   //start of main
+    char line[MAX_LINE];            //one input line
+    Token tok[MAX_TOKENS];          //tokens of the line
+    Cmd cmd[MAX_CMDS];              //commands of the pipeline
+    int ntok,ncmd,bg,ch,color=0,interactive=isatty(STDIN_FILENO);     //counts, background flag, colour on?, is stdin a terminal?
+    struct sigaction sa;            //how SIGINT is handled
+    if(getcwd(prevdir,sizeof(prevdir))==NULL)  //system call: the start folder is the first "cd -" target
+    {                               //start of error case
+        perror("myshell: getcwd");  //report it
+        return 1;                   //cannot run without a current folder
+    }                               //end of error case
+    strcpy(start_dir,prevdir);      //remember the start folder for pwd and the prompt
+    start_len=strcmp(start_dir,"/")==0?0:strlen(start_dir);   //started in "/": show full paths
+    memset(&sa,0,sizeof(sa));       //clear the sigaction settings
     sa.sa_handler=on_sigint;        //Ctrl+C does not kill the shell, only the running command
-    sigaction(SIGINT,&sa,NULL);
-    while(1)
-    {
-        reap_jobs();
-        if(interactive)
-        {
-            printf("myshell:%s> ",getcwd(cwd,sizeof(cwd))?show(cwd):"?");
-            fflush(stdout);
-        }
-        errno=0;
-        if(fgets(line,sizeof(line),stdin)==NULL)
-        {
-            if(errno==EINTR){clearerr(stdin);continue;}
-            if(interactive)printf("exit\n");
-            break;
-        }
-        if(strchr(line,'\n')==NULL&&!feof(stdin))
-        {
-            while((ch=getchar())!='\n'&&ch!=EOF);
-            fprintf(stderr,"myshell: input line too long (max %d characters)\n",MAX_LINE-2);
-            last_status=1;
-            continue;
-        }
-        line[strcspn(line,"\r\n")]='\0';
-        if(hist_expand(line)<0){last_status=1;continue;}
-        if(line[strspn(line," \t")]!='\0')hist_add(line);
-        if(tokenize(line,tok,&ntok)!=0||parse(tok,ntok,cmd,&ncmd,&bg)!=0)
-        {
-            last_status=2;
-            continue;
-        }
-        if(ncmd==0)continue;
-        last_status=execute(cmd,ncmd,bg);
-    }
-    return last_status;
-}
+    sigaction(SIGINT,&sa,NULL);     //system call: install the handler
+    if(interactive)                 //on a terminal: show the banner
+    {                               //start of terminal setup
+        color=isatty(STDOUT_FILENO);   //colours only when the output is a terminal too
+        printf("%s+------------------------------------------------------------+%s\n",color?C_CYAN:"",color?C_RESET:"");  //banner top line
+        printf("%s|  myshell - custom UNIX shell (CSE-3110 OS Lab, Assign. 1)  |%s\n",color?C_CYAN:"",color?C_RESET:"");  //banner title
+        printf("%s+------------------------------------------------------------+%s\n",color?C_CYAN:"",color?C_RESET:"");  //banner bottom line
+        printf("Type %shelp%s for commands, %shelp <cmd>%s for details, %sexit%s to quit.\n\n",   //how to get started
+               color?C_BOLD:"",color?C_RESET:"",color?C_BOLD:"",color?C_RESET:"",color?C_BOLD:"",color?C_RESET:"");  //bold keywords
+    }                               //end of terminal setup
+    while(1)                        //the read-execute loop, until exit or Ctrl+D
+    {                               //start of main loop
+        reap_jobs();                //report background jobs that finished
+        if(interactive)             //show a prompt only on a terminal
+        {                           //start of prompt
+            if(color)printf(C_CYAN "myshell" C_RESET "%s> " C_RESET,last_status?C_RED:"");    //prompt "myshell> " (red ">" after a failure)
+            else printf("myshell> ");   //plain prompt, exactly as in the assignment
+            fflush(stdout);         //show the prompt now
+        }                           //end of prompt
+        errno=0;                    //so EINTR can be told apart from end of input
+        at_prompt=1;                //Ctrl+C now only gives a fresh prompt
+        if(fgets(line,sizeof(line),stdin)==NULL)   //read one line
+        {                           //start of no-input case
+            at_prompt=0;            //no longer waiting for input
+            if(errno==EINTR){clearerr(stdin);continue;}    //Ctrl+C while waiting: just show a new prompt
+            if(interactive)printf("exit\n");   //Ctrl+D on a terminal: print "exit" like bash
+            break;                  //end of input: leave the loop
+        }                           //end of no-input case
+        at_prompt=0;                //a command may run now: its Ctrl+C output is its own
+        if(strchr(line,'\n')==NULL&&!feof(stdin))  //no newline: the line was longer than the buffer
+        {                           //start of too-long case
+            while((ch=getchar())!='\n'&&ch!=EOF);  //throw away the rest of that line
+            fprintf(stderr,"myshell: input line too long (max %d characters)\n",MAX_LINE-2);   //report it
+            last_status=1;          //failure
+            continue;               //next prompt
+        }                           //end of too-long case
+        line[strcspn(line,"\r\n")]='\0';   //remove the newline
+        if(hist_expand(line)<0){last_status=1;continue;}   //!! and !N; error if the entry is missing
+        if(line[strspn(line," \t")]!='\0')hist_add(line);  //save non-blank lines in history
+        if(tokenize(line,tok,&ntok)!=0||parse(tok,ntok,cmd,&ncmd,&bg)!=0)  //split into tokens, then commands
+        {                           //start of syntax error case
+            last_status=2;          //syntax errors give status 2, like bash
+            continue;               //next prompt
+        }                           //end of syntax error case
+        if(ncmd==0)continue;        //empty line or only a comment
+        last_status=execute(cmd,ncmd,bg);  //run it and keep the status for $?
+    }                               //end of main loop
+    return last_status;             //leave with the status of the last command
+}                                   //end of main

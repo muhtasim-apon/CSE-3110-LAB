@@ -14,7 +14,7 @@
 1. [Overview](#1-overview)
 2. [Submitted Files](#2-submitted-files)
 3. [Compilation and Running](#3-compilation-and-running)
-4. [Root Folder Protection (Sandbox)](#4-root-folder-protection-sandbox)
+4. [Paths and Safety](#4-paths-and-safety)
 5. [Commands and System Calls](#5-commands-and-system-calls)
 6. [Built-in Commands](#6-built-in-commands)
 7. [Parsing and the Execution Loop](#7-parsing-and-the-execution-loop)
@@ -36,7 +36,7 @@ The assignment rules are followed throughout:
 - Commands run in child processes created with `fork()`. Other programs are started with `execvp()`, and the parent waits with `waitpid()`.
 - Files are handled with `open()`, `read()`, `write()`, `close()`, `stat()`, `opendir()` and `readdir()`.
 
-**Extra design feature:** the folder where `myshell` is started becomes the shell's **root `/`**. Inside the shell, `/` means that folder, and `pwd` and the prompt show it by its name (started in `4_SH_01`, `pwd` prints `4_SH_01`). No command can reach anything above that folder: not `cd ..`, `ls ..`, `cat ../file`, `> ../file`, `/etc`, or a symlink that points outside.
+The shell behaves like a normal UNIX shell. Every example in the assignment works exactly as written, for example `ls -l /usr/bin`, `cp src.txt dest.txt`, `cd ..` and `cd` with no argument (home folder).
 
 ---
 
@@ -45,8 +45,10 @@ The assignment rules are followed throughout:
 | File | Description |
 |---|---|
 | `main.c` | Full source code of the shell (single file) |
-| `build_and_test.sh` | Compiles with `gcc -Wall -o myshell main.c` and runs **250 automated test cases** |
+| `build_and_test.sh` | Compiles with `gcc -Wall -o myshell main.c` and runs **310 automated test cases** |
 | `README.md` | This document |
+
+**Submission:** the three files are packed in one archive, **`4_SH_01.zip`**, named as the guidelines require (`[Roll No.]_[Assignment Number].zip`, for example `123_SH_01.zip`).
 
 ---
 
@@ -61,7 +63,7 @@ gcc -Wall -o myshell main.c
 **With the script:**
 ```bash
 chmod +x build_and_test.sh
-./build_and_test.sh          # compile, then run all 250 tests
+./build_and_test.sh          # compile, then run all 310 tests
 ./build_and_test.sh build    # compile only
 ./build_and_test.sh run      # compile, then start the shell
 ```
@@ -72,25 +74,30 @@ chmod +x build_and_test.sh
 
 ---
 
-## 4. Root Folder Protection (Sandbox)
+## 4. Paths and Safety
 
-At start-up the shell saves its current folder (`getcwd()`) as the root. Every path a user types is checked before use:
+Paths are passed to the kernel **unchanged**, exactly as in bash. Absolute paths, relative paths, `.`, `..` and symlinks are all resolved by the system calls themselves. The shell only expands `~` and `~/x` to the home folder (`$HOME`).
 
-1. **`resolve()`: building the path.** `/x` and `~/x` start at the root, and any other path starts at the current folder. The shell handles `.` and `..` itself. A `..` that would go above the root is rejected immediately.
-2. **`jail_check()`: checking symlinks.** `realpath()` is run on the path, or on its deepest existing parent. If the real location is outside the root, the path is rejected. This blocks symlinks such as `ln -s .. link` or `ln -s /etc link`. Dangling symlinks are blocked too.
-3. **`virt()` and `show()`: showing the path.** `virt()` gives a real path relative to the root (the root is `/`, `root/a/b` is `/a/b`); `cd -` uses it. `show()` prints the root by its folder name: the root is `4_SH_01` and `root/a/b` is `4_SH_01/a/b`. `show()` is used by `pwd`, by the prompt and in `$PWD`.
+**How paths are shown.** The folder where `myshell` is started is shown **by its name**, and nothing is blocked:
 
-| Where the check is used | Example blocked input |
+| Where you are | `pwd`, `cd -` and `$PWD` show |
 |---|---|
-| `cd`, `ls`, `cat`, `mkdir`, `touch`, `rm`, `cp`, `mv` | `cd ..` at `/`, `cd ../../..`, `ls ..`, `cat ../x`, `cp ../x .`, `mv a ../a` |
-| Redirection `<`, `>`, `>>` | `echo hi > ../out.txt`, `cat < ../secret` |
-| Path arguments of external programs | `/bin/ls ..`, `wc ../x`, `../script.sh`. `/x` is mapped to the real `root/x` |
-| Extra safety in `rm` / `mv` | `rm /`, `rm .`, `rm ..`, `rm` of the folder you are in, `mv /` |
+| the start folder | `4_SH_01` |
+| a folder inside it | `4_SH_01/demo/os` |
+| above or outside it (after `cd ..`, `cd /`, `cd ~`) | the full path, e.g. `/home/muhtasim/Desktop/CSE-3110-LAB/Assignment_01` |
 
-The blocked message is:
-```
-cd: ..: Permission denied (outside root directory)
-```
+`getcwd()` always returns the real path. `show_path()` only changes how it is printed, so `cd ..`, `ls -l /usr/bin` and every other path work normally.
+
+A few safety checks protect the user from accidents:
+
+| Check | Example |
+|---|---|
+| `rm` never removes `.` or `..` | `rm -r ..` → `rm: refusing to remove '.' or '..' directory: skipping '..'` |
+| `rm` never removes `/` (also `//`) | `rm -r /` → `rm: refusing to remove the root directory '/'` |
+| `rm` does not remove the folder you are in | `rm -r /path/to/cwd` → `current directory is inside it` |
+| `mv` never moves `/` | `mv / x` → `mv: cannot move the root directory` |
+| `rm` and `rm -r` **never follow symlinks** | `unlink()` is tried first: it removes a file or a link itself and fails with `EISDIR` only on a real folder. So `rm -r` cannot walk through a link into another folder |
+| `mv` moves a link, not its target | `rename()` never follows the link |
 
 ---
 
@@ -99,26 +106,26 @@ cd: ..: Permission denied (outside root directory)
 ### 5.1 File & Directory Inspection Commands
 | Command | Usage | System calls | Cases handled |
 |---|---|---|---|
-| `pwd` | `pwd` | `getcwd()` | prints the path with the root folder's name (`4_SH_01`, `4_SH_01/a/b`) |
-| `ls` | `ls [-a] [-l] [path...]` | `opendir()`, `readdir()`, `closedir()`, `stat()`, `lstat()`, `readlink()`, `getpwuid()` | sorted output; folders end with `/`; hidden files only with `-a`; `-l` shows mode, links, owner, size and time; files or several folders as arguments; missing path; invalid option |
-| `cd` | `cd [dir \| - \| ~ \| /]` | `chdir()`, `stat()`, `getcwd()` | **built-in**; no argument, `~` or `/` go to the root; `cd -` goes to the previous folder; `cd ..` is blocked at the root; not-a-directory; too many arguments |
+| `pwd` | `pwd` | `getcwd()` | prints the current folder; inside the start folder by its name (`4_SH_01`, `4_SH_01/demo`), above it the full path |
+| `ls` | `ls [-a] [-l] [path...]` | `opendir()`, `readdir()`, `closedir()`, `stat()` (`-l` owner name: `getpwuid()`) | sorted output; folders end with `/`; hidden files only with `-a`; `-l` shows mode, links, owner, size and time; files or several folders as arguments; missing path; invalid option |
+| `cd` | `cd [dir \| - \| ~ \| /]` | `chdir()`, `getcwd()` | **built-in**; `chdir()` itself reports a missing folder or not-a-directory; no argument or `~` go to `$HOME`; `cd ..` goes to the parent folder; `cd -` goes back to the previous folder and prints it; `cd ""` stays in place; not-a-directory; too many arguments |
 | `whoami` | `whoami` | `getuid()`, `getpwuid()` | |
 | `uname` | `uname [-a -s -n -r -v -m]` | `uname()` | labelled table without options; single-line output with options; invalid option |
 
 ### 5.2 File & Directory Manipulation Commands
 | Command | Usage | System calls | Cases handled |
 |---|---|---|---|
-| `mkdir` | `mkdir [-p] dir...` | `mkdir()` with mode **0755** | several folders; `-p` creates parents; already exists; missing parent; no argument |
+| `mkdir` | `mkdir [-p] dir...` | `mkdir()` with mode **0755** (`-p` uses `stat()` to accept an existing folder) | several folders; `-p` creates parents; already exists; missing parent; no argument |
 | `touch` | `touch file...` | `open()` with `O_CREAT`, `close()`, `utimensat()` | new empty file; existing file keeps its content and gets a new time; directory; missing parent |
-| `rm` | `rm [-r] [-f] path...` | `lstat()`, `unlink()`, `rmdir()` (`-r` also uses `opendir()`/`readdir()`) | file; empty folder; non-empty folder gives an error (or `-r`); `-f` ignores missing files; a symlink is removed without its target being touched |
-| `cp` | `cp src dst` or `cp src... dir` | `open()`, `read()`, `write()`, `close()`, `stat()` | overwrite; copy into a folder; same-file check; source is a folder; keeps file mode; 1 MB binary copied exactly |
-| `mv` | `mv src dst` or `mv src... dir` | `rename()`, `lstat()` | rename; move into a folder; move a folder into itself is refused; missing source |
+| `rm` | `rm [-r] [-f] path...` | `unlink()`, `rmdir()` (`-r` also uses `opendir()`/`readdir()`/`closedir()`) | `unlink()` is tried first and fails with `EISDIR` on a folder, which then goes to `rmdir()`; file; empty folder; non-empty folder gives an error (or `-r`); `-f` ignores missing files; a symlink is removed without its target being touched |
+| `cp` | `cp src dst` or `cp src... dir` | `open()`, `read()`, `write()`, `close()` (`stat()` for checks) | unreadable source (`cannot open 'x' for reading`); overwrite; copy into a folder; same-file check; source is a folder; keeps file mode; 1 MB binary copied exactly |
+| `mv` | `mv src dst` or `mv src... dir` | `rename()` (`stat()` for checks) | rename; overwrite; move one or several into a folder; several with a target that is not a folder; move a folder into itself is refused; missing source |
 
 ### 5.3 File Viewing & Process Inspection Commands
 | Command | Usage | System calls / source | Cases handled |
 |---|---|---|---|
 | `cat` | `cat [file...]` | `open()`, `read()`, `write()`, `close()` | several files; missing file followed by a valid one; a directory; empty file; no argument (or `-`) reads standard input, which lets it work with `<` and pipes |
-| `echo` | `echo [-n] text...` | `write()` (through stdout) | **built-in**; `$VAR`, `${VAR}`, `$?`; quotes; `-n` |
+| `echo` | `echo [-n] text...` | `write()` (through stdout), `getenv()` | **built-in**; `$VAR`, `${VAR}`, `$?`, `$PWD`; quotes; `-n` |
 | `uptime` | `uptime` | `open()`/`read()` of `/proc/uptime` and `/proc/loadavg` | days/hours/minutes/seconds plus 1/5/15-minute load average |
 | `meminfo` | `meminfo` | `open()`/`read()` of `/proc/meminfo`, parsed with `sscanf()` | Total, Free, Available, Buffers, Cached, Swap, plus a calculated Used |
 
@@ -133,25 +140,30 @@ These run **inside the shell process, without `fork()`**. `cd` and `exit` have t
 | `cd` | see 5.1 |
 | `echo` | prints its arguments; supports `echo $PATH`, `echo Hello`, `echo "a   b"`, `echo '$HOME'` (literal) |
 | `exit [n]` | ends the shell with status `n` (default: the status of the last command). `exit abc` gives an error and status 2; `exit 1 2` gives "too many arguments" and the shell keeps running |
-| `help` | shows every command, its options, the operators and the root rule |
+| `help [command]` | `help` shows every command grouped by kind, the operators, quoting and keys. `help ls` (or `help cp mv`) shows each command's usage, description and **the system calls it uses**. An unknown name gives `help: no help topic for 'x'` and status 1 |
 | `history [n]` | lists the last commands (all, or the last `n`) |
 
-When a built-in is used with a redirection (`history > file`), the shell saves stdin/stdout with `dup()`, redirects them with `dup2()`, runs the command, and then restores them.
+When a built-in is used with a redirection (`history > file`), the shell copies stdin/stdout to spare descriptors 100/101 with `dup2()`, redirects them with `dup2()`, runs the command, and then restores them with `dup2()`.
 
 ---
 
 ## 7. Parsing and the Execution Loop
 
-- **Loop:** prints the prompt `myshell:4_SH_01/current/folder> `, reads a line with `fgets()`, runs it, and repeats until `exit` or EOF. The prompt appears only on a terminal (`isatty()`), so piped test input stays clean.
+- **Loop:** reads a line with `fgets()`, runs it, and repeats until `exit` or EOF.
+- **Terminal UI:** on a terminal (`isatty()`), the shell starts with a banner and shows the prompt **`myshell> `**, exactly as in the assignment. Use `pwd` to see the current folder.
+  - `myshell` is cyan, and the `>` turns red after a failed command.
+  - **Ctrl+C** at the prompt gives a fresh prompt on a new line. While a command runs, Ctrl+C stops only that command (status 130). A shell started inside another myshell does not print an extra blank line.
+  - Colours are used only when stdout is a terminal. With piped input there is no banner and no prompt, so test output stays clean.
 - **Tokenizer:**
   - splits words on spaces and tabs;
   - recognises `|`, `<`, `>`, `>>` and `&` even without spaces (`echo hi>f.txt`);
   - `"double quotes"` keep spaces and expand variables;
   - `'single quotes'` are fully literal;
   - `\` escapes one character;
-  - `#` starts a comment.
-- **Variables:** `$NAME`, `${NAME}`, `$?` (last exit status) and `$$` (shell PID). An unset variable expands to nothing.
-- **Parser:** groups words into commands joined by pipes and attaches their redirections. Syntax errors give a clear message, for example:
+  - `#` starts a comment;
+  - operators inside quotes are plain text (`echo "a|b > c"`).
+- **Variables:** `$NAME`, `${NAME}` (from `getenv()`), `$PWD` (from `getcwd()`) and `$?` (last exit status). An unset variable expands to nothing.
+- **Parser:** groups words into commands joined by pipes and attaches their redirections. Redirections are kept **in the order typed** and applied in that order, as in bash: `echo a > f1 > f2` creates both files and writes to `f2`, and `cat < missing > out` stops at the error, so `out` is not created. Syntax errors give a clear message, for example:
   ```
   myshell: syntax error near unexpected token `newline'     (ls >)
   myshell: syntax error near unexpected token `|'           (| ls,  ls | | cat)
@@ -162,7 +174,8 @@ When a built-in is used with a redirection (`history > file`), the shell saves s
 - **Limits:**
   - lines longer than 1022 characters are rejected with a message, and the shell keeps running;
   - at most 63 arguments per command;
-  - at most 16 commands in one pipeline.
+  - at most 16 commands in one pipeline;
+  - at most 16 redirections per command.
 - **Signals:** the shell catches `SIGINT` with `sigaction()`. Foreground children get the default action back, and background children ignore it.
 
 ---
@@ -174,7 +187,7 @@ All four optional features are implemented.
 | # | Feature | How it works | System calls |
 |---|---|---|---|
 | 1 | **Piping** `cmd1 \| cmd2 \| ...` | one `pipe()` between each pair of commands; each command runs in its own child | `pipe()`, `fork()`, `dup2()`, `close()`, `waitpid()` |
-| 2 | **I/O redirection** `<`, `>`, `>>` | the file is opened inside the root and placed on stdin/stdout. `>` truncates, `>>` appends. Works together with pipes | `open()`, `dup2()`, `close()` |
+| 2 | **I/O redirection** `<`, `>`, `>>` | each file is opened in the order typed and placed on stdin/stdout. `>` truncates, `>>` appends (and creates a missing file). Works with built-ins and together with pipes | `open()`, `dup2()`, `close()` |
 | 3 | **Background** `cmd &` | the parent does not wait and prints `[job] pid`. Before each prompt, finished jobs are collected and reported as `[job] Done (status n)`. Background jobs read from `/dev/null` | `fork()`, `waitpid(-1, …, WNOHANG)` |
 | 4 | **History** | in-memory list of the last 100 commands: `history`, `history n`, `!!` (repeat the last), `!n` (repeat number n) | |
 
@@ -187,13 +200,16 @@ Every error goes to **stderr**, in the form `command: object: reason`, using `pe
 rm: cannot remove 'd': Directory not empty (use rm -r)
 cp: cannot stat 'nope': No such file or directory
 cat: d: Is a directory
+cat: locked: Permission denied
+myshell: ro/f: Permission denied
+./s.sh: Permission denied
 notacommand: command not found
 ```
 
 | Exit status | Meaning |
 |---|---|
 | `0` | success |
-| `1` | command failed (missing file, blocked path, bad argument) |
+| `1` | command failed (missing file, no permission, bad argument) |
 | `2` | syntax error, or `exit` with a non-numeric argument |
 | `126` | program found but could not be executed |
 | `127` | command not found |
@@ -203,21 +219,26 @@ notacommand: command not found
 
 ## 10. Test Cases
 
-`build_and_test.sh` compiles the shell and then runs every test in a **fresh, empty folder**, so that folder is the shell's root `/`. A decoy file is placed one level above it. This proves that nothing outside the root can be read, changed or deleted.
+`build_and_test.sh` compiles the shell and then runs every test in a **fresh, empty folder**. A file `decoy.txt` is placed one level above it, and `HOME` is set to that parent folder, so `cd`, `~` and `..` give known paths. The test folder is named `work`, so inside it `pwd` prints `work/...`. The safety tests check on disk that `rm -r` never deletes anything through a symlink.
 
-Four kinds of check are used:
+- The permission tests (group 19) are skipped when the script runs as root, because root ignores file permissions.
+- The terminal tests (group 22) use the standard `script` command to give the shell a real terminal.
+
+Five kinds of check are used:
 - `check`: the output must match exactly (stdout and stderr together);
 - `contains`: the output must contain a given text;
+- `matches`: one output line must match a regular expression (used for changing numbers such as uptime);
 - `status`: the shell's exit status;
 - `fact`: a condition on disk afterwards (file exists, `cmp`, file mode, and so on).
 
-**Result: 250 passed, 0 failed.**
+**Result: 310 passed, 0 failed** (the same result on repeated runs).
 
 | # | Group | Tests | What is covered |
 |---|---|---|---|
-| 1 | Root folder (sandbox) | 58 | `pwd` = root folder name; `cd ..`, `../../..`, `d1/../..` and `./../` blocked; `cd /`, `cd`, `cd ~`, `cd -`, `cd /a/b`; `/home` and the real parent path stay inside; virtual `$PWD`; `ls`/`cat`/`cp`/`mv`/`touch`/`mkdir`/`rm` with `..` blocked, with disk checks; `rm .`, `rm /`, `rm` of the current folder, `mv /`; symlink escapes; dangling symlink; a symlink inside the root works; `<`/`>` outside; external `/bin/ls ..`, `wc ../x`, `../evil.sh` |
-| 2 | pwd / cd errors | 4 | nested `pwd`, missing folder, `cd` into a file, too many arguments |
-| 3 | ls | 14 | empty folder, sorting, `/` marks, hidden files, `-a`, file argument, nested path, several folders, `-l` mode/size/dir, `-la`, missing path, invalid option |
+| 1 | pwd, cd and paths | 34 | `pwd` shows the start folder by name (`work`, `work/d1`); full path above it; a sibling `work2` is not shortened; short name again after coming back; `cd d1` / `cd ..`; `cd ..` leaves the start folder; `cd a/b/../..`; `cd /`; `cd ..` at `/`; `cd ///`; `cd` and `cd ~` = `$HOME`; `cd ~/x`; `cd -`; absolute path; missing path; `$PWD`; symlinked folder; `ls ..`; **`ls -l /usr/bin`** (the assignment's example); `cat ../file`, absolute path, `~/file`, file symlink; `cp`/`mv`/`touch`/`>`/`<` with `../` (checked on disk); external program with `..` |
+| 1b | Safety | 12 | `rm .`, `rm -r ..`, `rm -r /`, `rm -r //`, `mv /`, `rm` of the current folder, `rm` of a symlink removes only the link, `rm -r` never follows a symlink (checked on disk), `mv` of a symlink |
+| 2 | pwd / cd errors | 5 | nested `pwd`, missing folder, `cd` into a file, too many arguments, `cd ""` stays |
+| 3 | ls | 14 | empty folder, sorting, `/` marks, hidden files, `-a` shows `.` and `..`, file argument, nested path, several folders, `-l` mode/size/dir, `-la`, missing path, invalid option |
 | 4 | whoami / uname | 7 | same as `id -un`; table; `-a`, `-r`, `-sm`; invalid option |
 | 5 | mkdir | 8 | mode 0755, several, already exists, `-p` nested, `-p` existing, missing parent, no argument |
 | 6 | touch | 8 | new empty file, several, keeps content and updates time, directory, missing parent, no argument |
@@ -227,49 +248,62 @@ Four kinds of check are used:
 | 10 | cat | 6 | one file, several, missing + valid, directory, empty file, stdin |
 | 11 | echo & variables | 18 | spaces, double/single quotes, `$HOME`, `${HOME}x`, `$PATH`, unset variable, `$?` after success/failure/not-found, `-n`, no argument, escapes, lone `$`, unterminated quote, bad substitution |
 | 12 | uptime / meminfo | 5 | every field is present |
-| 13 | help / history | 10 | help text, `history`, `history n`, `!!`, `!n`, event not found, bad argument, blank lines not stored |
+| 13 | help / history | 16 | help text, `help cd`, `help ls`, `help cp mv`, unknown topic, `help ls \| cat`, no banner or prompt when piped, `history`, `history n`, `!!`, `!n`, event not found, bad argument, blank lines not stored |
 | 14 | exit | 9 | stops the loop, status 0, `exit 5`, `exit 256`, last status, `exit abc`, too many arguments, EOF |
 | 15 | Parsing | 8 | empty lines, tabs, comments, unknown command, external program with arguments, line too long (shell continues), too many arguments |
 | 16 | Redirection, pipes, background | 22 | `>`, `>` without spaces, truncate, `>>`, `<`, `<` + `>`, missing input file, `ls \| cat`, 3-stage pipe, pipe into a file, built-in in a pipe, `cd` in a pipe, 6 syntax errors, background does not block, Done message, background + redirect |
-| 17 | Extra corner cases | 19 | relative `..` symlink escape, `echo piped\|cat`, `history \| cat`, `cat < f \| cat > g`, `history > file`, no colour codes in files, `ls > x \| cat`, `ls \| cat < a`, missing `<` file in a pipe, background pipeline, `&` alone, `expr 40 + 2`, two pipes |
-| 18 | Assignment rules | 25 | no `system(`/`popen(`; no `-Wall` warnings; each of the 23 required system calls is used |
-| | **Total** | **250** | |
+| 17 | Extra corner cases | 19 | relative `..` symlink (`cd`, `ls`, `cat` through it), `echo piped\|cat`, `history \| cat`, `cat < f \| cat > g`, `history > file`, no colour codes in files, `ls > x \| cat`, `ls \| cat < a`, missing `<` file in a pipe, background pipeline, `&` alone, `expr 40 + 2`, two pipes |
+| 18 | Assignment rules | 31 | no `system(`/`popen(`; none of `realpath`, `lstat`, `readlink`, `getpid`, `setenv` or `dup` (only the named calls); no `-Wall` warnings; each of the 23 required system calls is used |
+| 19 | Error handling | 17 | unreadable file for `cat`, `cp` and `<`; `mkdir`, `touch`, `rm` and `>` in a read-only folder; `cd` without `x`, `ls` without `r`; `>` to a folder; `>` and `mv` into a missing folder; non-executable file (126); executable script; killed by a signal (137); `$?` of external programs; `$?` = 2 after a syntax error |
+| 20 | More edge cases | 33 | `exit -1` (255); `exit` in a pipe; built-in redirect restores stdout; `cd` with a redirect; `history 0` / `-1`; `!1 b`; history past 100 entries (numbering, forgotten entries); operators in quotes; trailing comment; empty `""` argument; `echo -n` alone; `uname -s -m`; uname table fields; uptime and load-average number format; MemTotal equals `/proc/meminfo`; `mv` several / overwrite; `cat a - b`; `touch` mode 644; `>>` creates; `> f1 > f2`; `< missing > f3`; 16-command pipeline works and 17 is refused; two background jobs, non-zero Done status |
+| 21 | No system binaries | 3 | with an **empty `PATH`**, all 14 commands still work (`mkdir`, `touch`, `cp`, `mv`, `cat`, `ls`, `rm`, `pwd`, `whoami`, `uname`, `uptime`, `meminfo`, `echo`), while a real program (`wc`) is not found. This proves no system binary is used |
+| 22 | Interactive | 6 | on a real terminal: banner, prompt is exactly `myshell> ` (no folder, no user@host), loop continues after an error; Ctrl+C at the prompt does not kill the shell; Ctrl+C stops a running `sleep` with status 130 |
+| | **Total** | **310** | |
 
 ---
 
 ## 11. Sample Session
 
-This is real output, with the shell started in an empty folder named `4_SH_01`:
+This is real output from `./myshell` started in the project folder `4_SH_01`. The prompt is `myshell> `. Inside that folder `pwd` shows it by its name; after `cd ..` the full path is shown, and nothing is blocked. On a terminal `myshell` is cyan and the `>` turns red after a failed command.
 ```
-myshell:4_SH_01> pwd
++------------------------------------------------------------+
+|  myshell - custom UNIX shell (CSE-3110 OS Lab, Assign. 1)  |
++------------------------------------------------------------+
+Type help for commands, help <cmd> for details, exit to quit.
+
+myshell> pwd
 4_SH_01
-myshell:4_SH_01> cd ..
-cd: ..: Permission denied (outside root directory)
-myshell:4_SH_01> mkdir -p projects/os
-myshell:4_SH_01> cd projects/os
-myshell:4_SH_01/projects/os> pwd
-4_SH_01/projects/os
-myshell:4_SH_01/projects/os> cd ../../..
-cd: ../../..: Permission denied (outside root directory)
-myshell:4_SH_01/projects/os> echo "Hello from $USER" > note.txt
-myshell:4_SH_01/projects/os> cat note.txt
+myshell> mkdir -p demo/os
+myshell> cd demo/os
+myshell> pwd
+4_SH_01/demo/os
+myshell> echo "Hello from $USER" > note.txt
+myshell> cat note.txt
 Hello from muhtasim
-myshell:4_SH_01/projects/os> cp note.txt copy.txt
-myshell:4_SH_01/projects/os> ls -l
--rw-r--r--  1 muhtasim       20 Oct 11 21:45 copy.txt
--rw-r--r--  1 muhtasim       20 Oct 11 21:45 note.txt
-myshell:4_SH_01/projects/os> cat note.txt | tr a-z A-Z
+myshell> cp note.txt copy.txt
+myshell> ls -l
+-rw-r--r--  1 muhtasim       20 Oct 17 20:21 copy.txt
+-rw-r--r--  1 muhtasim       20 Oct 17 20:21 note.txt
+myshell> cat note.txt | tr a-z A-Z
 HELLO FROM MUHTASIM
-myshell:4_SH_01/projects/os> cd /
-myshell:4_SH_01> cat ../secret.txt
-cat: ../secret.txt: Permission denied (outside root directory)
-myshell:4_SH_01> ls
-projects/
-myshell:4_SH_01> history 3
-   13  cat ../secret.txt
-   14  ls
-   15  history 3
-myshell:4_SH_01> exit
+myshell> cd ../..
+myshell> rm -r demo
+myshell> cd ..
+myshell> pwd
+/home/muhtasim/Desktop/CSE-3110-LAB/Assignment_01
+myshell> cd -
+4_SH_01
+myshell> ls -l /usr/bin | head -3
+-rwxr-xr-x  1 root        16249 May 22 21:41 GET
+-rwxr-xr-x  1 root        16249 May 22 21:41 HEAD
+-rwxr-xr-x  1 root        16249 May 22 21:41 POST
+myshell> help pwd
+pwd
+  usage : pwd
+  Print the current directory. Inside the start folder it is shown by
+  that folder's name (e.g. 4_SH_01/demo); above it, the full path.
+  system calls: getcwd()
+myshell> exit
 ```
 
 ---
@@ -281,7 +315,7 @@ Each item below is checked against the assignment document. The last column name
 ### I. Objectives
 | Requirement | Status | Proof |
 |---|---|---|
-| a. Accept interactive commands with a prompt | ✅ | `myshell:4_SH_01/dir> ` prompt, §11 |
+| a. Accept interactive commands with a prompt | ✅ | `myshell> ` prompt, exactly as in the assignment, with a banner; group 22, §11 |
 | b. Parse and tokenize input into commands and arguments | ✅ | groups 11, 15 |
 | c. Fork child processes and run programs with the exec family | ✅ | `fork()` + `execvp()`, groups 15, 16 |
 | d. Built-in commands and direct POSIX system calls | ✅ | groups 1–14 |
@@ -310,42 +344,48 @@ Each item below is checked against the assignment document. The last column name
 | No `system()` shell execution | ✅ | group 18 (grep for `system(`/`popen(`) |
 | Process control with `fork()`, `execvp()`, `waitpid()` | ✅ | group 18 |
 | File APIs `open/read/write/close/stat/opendir/readdir` | ✅ | group 18 |
-| No standard binaries used for the manual utilities | ✅ | all 14 are written in `main.c` |
+| No standard binaries used for the manual utilities | ✅ | all 14 are written in `main.c`; group 21 runs them all with an **empty `PATH`** |
 
 ### III. Built-in Command Handling (in the parent process)
 | Requirement | Status | Proof |
 |---|---|---|
-| `cd` with `chdir()`, including `cd ..` and `cd` with no arguments | ✅ | group 1 |
+| `cd` with `chdir()`, including `cd ..` and `cd` with no arguments | ✅ | group 1 (`cd ..` goes to the parent, `cd` goes to `$HOME`) |
 | `echo` text and environment variables (`echo $PATH`, `echo Hello`) | ✅ | group 11 |
 | `exit` with a status code | ✅ | group 14 (`exit 5` gives status 5) |
-| `help` menu | ✅ | group 13 |
+| `help` menu, plus `help <command>` pages | ✅ | group 13 |
 
 ### IV. Command Parsing & Execution Loop
 | Requirement | Status | Proof |
 |---|---|---|
-| a. Multiple arguments (`ls -l dir`, `cp src dst`) | ✅ | groups 3, 8 |
-| b. Clear errors for invalid commands, missing arguments and file errors (`perror`/`strerror`) | ✅ | almost every group |
-| c. Continuous loop with prompt until `exit` | ✅ | group 14, §11 |
+| a. Multiple arguments (`ls -l /usr/bin`, `cp src.txt dest.txt`) | ✅ | groups 1, 3, 8 (`ls -l /usr/bin` exactly as written in the assignment) |
+| b. Clear errors for invalid commands, missing arguments and file errors (`perror`/`strerror`) | ✅ | group 19 (permission, exec and signal errors), plus missing-argument and missing-file tests in groups 2–15 |
+| c. Continuous loop with prompt until `exit` | ✅ | groups 14, 22, §11 |
 
 ### V. Advanced Features (extra credit)
 | Feature | Status | Proof |
 |---|---|---|
 | 1. Piping with `pipe()` + `dup2()` | ✅ | groups 16, 17 |
-| 2. Redirection `>`, `<`, `>>` | ✅ | groups 16, 17 |
-| 3. Background execution with `&` | ✅ | groups 16, 17 |
-| 4. Command history | ✅ | group 13 |
+| 2. Redirection `>`, `<`, `>>` | ✅ | groups 16, 17, 20 |
+| 3. Background execution with `&` | ✅ | groups 16, 17, 20 |
+| 4. Command history | ✅ | groups 13, 20 |
 
 ### Deliverables
 | Deliverable | Status |
 |---|---|
 | Single C source file with the full shell (`main.c`) | ✅ |
 | Shell script that compiles with `gcc -Wall -o myshell main.c` and runs automated tests (`build_and_test.sh`) | ✅ |
-| README with compilation steps, system calls per command, features and test cases | ✅ |
+| README with compilation steps, system calls per command, features and test cases | ✅ (§3, §5, §6–8, §10) |
+| One `.zip` named `[Roll No.]_[Assignment Number].zip` with the three files | ✅ `4_SH_01.zip` |
 
 ---
 
 ## 13. Known Limitations
 
-- Programs started with `execvp()` (for example `python3`) have their **path arguments** checked against the root, but a program can still open other files on its own. Fully confining external programs would need `chroot()` and root privileges.
 - History is kept **in memory** only and is cleared when the shell exits, as the assignment describes.
 - `cp` copies regular files only (no `cp -r`). `rm -r` is supported.
+- `ls -l` shows a symlink with its target's details, because only `stat()` is used (as the assignment names). It does not use `lstat()`/`readlink()`, so `ls -l` does not print `link -> target`.
+- There is no arrow-key line editing, because input is read with `fgets()`.
+- Besides the calls each command uses, the shell itself needs a few support calls:
+  - `sigaction()`/`signal()`, so Ctrl+C stops only the running command;
+  - `isatty()`, to show the prompt only on a terminal;
+  - `getenv()`, for `echo $PATH` (which the assignment requires) and for `~`.

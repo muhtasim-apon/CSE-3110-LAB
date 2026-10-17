@@ -5,11 +5,10 @@
 # Usage:
 #   ./build_and_test.sh          compile, then run all tests
 #   ./build_and_test.sh build    compile only
-#   ./build_and_test.sh run      compile, then start the shell (root = this folder)
+#   ./build_and_test.sh run      compile, then start the shell
 #
-# Every test starts myshell inside a fresh empty folder ($JAIL), so that folder is the
-# shell's root "/". A decoy file is placed one level above it, in $BASE, to prove that
-# no command can reach outside the root.
+# Every test starts myshell inside a fresh empty folder ($WORK). A file "decoy.txt" lies one
+# level above it, in $BASE, and HOME is set to $BASE so that "cd" and "~" give known paths.
 
 cd "$(dirname "$0")" || exit 1
 
@@ -31,23 +30,26 @@ fi
 
 SHELL_BIN="$(pwd)/myshell"
 SRC="$(pwd)/main.c"
-BASE=$(mktemp -d)
-JAIL="$BASE/jail"
+BASE=$(cd "$(mktemp -d)" && pwd -P)     # physical path, as getcwd() reports it
+WORK="$BASE/work"
+export HOME="$BASE"                     # a known home folder for cd and ~
 export LC_ALL=C
+umask 022                               # new files 644, new folders 755
 PASS=0
 FAIL=0
 
-# fresh "bash setup": empty jail, decoy outside it, then run the setup inside the jail
+# fresh "bash setup": empty work folder, decoy above it, then run the setup inside it
 fresh() {
-    rm -rf "$JAIL"
-    mkdir -p "$JAIL"
+    [ -d "$WORK" ] && chmod -R u+rwx "$WORK" 2>/dev/null     # permission tests leave locked folders
+    rm -rf "$WORK"
+    mkdir -p "$WORK"
     echo "secret" > "$BASE/decoy.txt"
-    rm -rf "$BASE/out" "$BASE/x" "$BASE/x.txt" "$BASE/newfile"
-    [ -n "$1" ] && (cd "$JAIL" && eval "$1")
+    rm -rf "$BASE/out" "$BASE/x" "$BASE/x.txt" "$BASE/newfile" "$BASE/work2"
+    [ -n "$1" ] && (cd "$WORK" && eval "$1")
 }
 # run "myshell input" (\n separates lines)
 run() {
-    (cd "$JAIL" && printf '%b\n' "$1" | "$SHELL_BIN" 2>&1)
+    (cd "$WORK" && printf '%b\n' "$1" | "$SHELL_BIN" 2>&1)
 }
 ok()  { echo "PASS: $1"; PASS=$((PASS + 1)); }
 bad() { echo "FAIL: $1"; echo "   input   : $2"; echo "   expected: $3"; echo "   got     : $4"; FAIL=$((FAIL + 1)); }
@@ -64,89 +66,85 @@ contains() {
 }
 # status "name" "input" "expected exit status of myshell" ["setup"]
 status() {
-    fresh "$4"; (cd "$JAIL" && printf '%b\n' "$2" | "$SHELL_BIN" >/dev/null 2>&1); st=$?
+    fresh "$4"; (cd "$WORK" && printf '%b\n' "$2" | "$SHELL_BIN" >/dev/null 2>&1); st=$?
     if [ "$st" = "$3" ]; then ok "$1"; else bad "$1" "$2" "status $3" "status $st"; fi
 }
 # fact "name" "bash condition checked after the previous test"
+# matches "name" "input" "extended regex one output line must match" ["setup"]
+matches() {
+    fresh "$4"; out=$(run "$2")
+    if printf '%s\n' "$out" | grep -qE -- "$3"; then ok "$1"; else bad "$1" "$2" "(regex) $3" "$out"; fi
+}
 fact() {
-    if (cd "$JAIL" && eval "$2"); then ok "$1"; else bad "$1" "(after previous test)" "$2" "false"; fi
+    if (cd "$WORK" && eval "$2"); then ok "$1"; else bad "$1" "(after previous test)" "$2" "false"; fi
 }
 
-DENY="Permission denied (outside root directory)"
-R=$(basename "$JAIL")     # pwd and the prompt show the root by its folder name
-echo "Running tests in $JAIL"
+W="$WORK"
+R=$(basename "$WORK")     # pwd and the prompt show the start folder by its name ("work/...")
+echo "Running tests in $WORK"
 
-echo; echo "== 1. Root folder (jail) =="
-check    "pwd at start shows folder name" "pwd"                               "$R"
-check    "cd .. at root is blocked"        "cd ..\npwd"                        "cd: ..: $DENY"$'\n'"$R"
-check    "cd d1 then cd .. returns to root" "mkdir d1\ncd d1\npwd\ncd ..\npwd"  "$R/d1"$'\n'"$R"
-check    "second cd .. from d1 blocked"    "mkdir d1\ncd d1\ncd ..\ncd ..\npwd" "cd: ..: $DENY"$'\n'"$R"
-check    "cd ../../.. blocked"             "cd ../../..\npwd"                  "cd: ../../..: $DENY"$'\n'"$R"
-check    "cd d1/../.. blocked"             "mkdir d1\ncd d1/../..\npwd"        "cd: d1/../..: $DENY"$'\n'"$R"
-check    "cd ./../ blocked"                "cd ./../"                          "cd: ./../: $DENY"
-check    "cd a/b/../../.. blocked"         "mkdir -p a/b\ncd a/b/../../..\npwd" "cd: a/b/../../..: $DENY"$'\n'"$R"
-check    "cd a/b/../.. stays inside"       "mkdir -p a/b\ncd a/b/../..\npwd"   "$R"
-check    "cd / goes to root"               "mkdir -p a/b\ncd a/b\ncd /\npwd"   "$R"
-check    "cd (no args) goes to root"       "mkdir -p a/b\ncd a/b\ncd\npwd"     "$R"
-check    "cd ~ goes to root"               "mkdir a\ncd a\ncd ~\npwd"          "$R"
-check    "cd ~/a"                          "mkdir a\ncd ~/a\npwd"              "$R/a"
-check    "cd - returns to previous"        "mkdir a\ncd a\ncd /\ncd -\npwd"    "$R/a"$'\n'"$R/a"
-check    "cd /a/b absolute inside root"    "mkdir -p a/b\ncd /a/b\npwd"        "$R/a/b"
-check    "cd /// is root"                  "mkdir a\ncd a\ncd ///\npwd"        "$R"
-check    "cd /home is not the real /home"  "cd /home"                          "cd: /home: No such file or directory"
-check    "cd to real parent path fails"    "cd $BASE"                          "cd: $BASE: No such file or directory"
-check    "\$PWD is virtual"                'mkdir a\ncd a\necho $PWD'          "$R/a"
-check    "ls .. blocked"                   "ls .."                             "ls: ..: $DENY"
-check    "ls ../.. blocked"                "mkdir a\ncd a\nls ../.."           "ls: ../..: $DENY"
-check    "ls /etc is inside root"          "ls /etc"                           "ls: cannot access '/etc': No such file or directory"
-check    "cat ../decoy.txt blocked"        "cat ../decoy.txt"                  "cat: ../decoy.txt: $DENY"
-check    "cp ../decoy.txt blocked"         "cp ../decoy.txt x.txt"             "cp: ../decoy.txt: $DENY"
-fact     "  nothing copied"                "[ ! -e x.txt ]"
-check    "cp to ../ blocked"               "cp a.txt ../x.txt"                 "cp: ../x.txt: $DENY"  "echo hi > a.txt"
-fact     "  nothing written outside"       "[ ! -e $BASE/x.txt ]"
-check    "mv to ../ blocked"               "mv a.txt ../x.txt"                 "mv: ../x.txt: $DENY"  "echo hi > a.txt"
-fact     "  file still inside"             "[ -f a.txt ] && [ ! -e $BASE/x.txt ]"
-check    "mv ../decoy.txt blocked"         "mv ../decoy.txt here.txt"          "mv: ../decoy.txt: $DENY"
-check    "touch ../x blocked"              "touch ../x"                        "touch: ../x: $DENY"
-fact     "  nothing created outside"       "[ ! -e $BASE/x ]"
-check    "mkdir ../x blocked"              "mkdir ../x"                        "mkdir: ../x: $DENY"
-check    "mkdir -p ../../x blocked"        "mkdir -p ../../x"                  "mkdir: ../../x: $DENY"
-check    "rm ../decoy.txt blocked"         "rm ../decoy.txt"                   "rm: ../decoy.txt: $DENY"
-fact     "  decoy still exists"            "[ -f $BASE/decoy.txt ]"
-check    "rm -r .. refused"                "rm -r .."                          "rm: refusing to remove '.' or '..' directory: skipping '..'"
-fact     "  decoy still exists"            "[ -f $BASE/decoy.txt ]"
+echo; echo "== 1. pwd, cd and paths =="
+check    "pwd shows the start folder name" "pwd"                               "$R"
+check    "cd d1 and cd .. back"            "mkdir d1\ncd d1\npwd\ncd ..\npwd"  "$R/d1"$'\n'"$R"
+check    "cd .. leaves the start folder"   "cd ..\npwd"                        "$BASE"
+check    "above the start: full path"      "cd ../..\npwd"                     "$(dirname "$BASE")"
+check    "sibling work2 is not shortened"  "mkdir ../work2\ncd ../work2\npwd"  "$BASE/work2"
+check    "back inside: short name again"   "mkdir a\ncd ..\ncd work/a\npwd"    "$R/a"
+check    "cd a/b/../.."                    "mkdir -p a/b\ncd a/b/../..\npwd"   "$R"
+check    "cd / goes to /"                  "cd /\npwd"                         "/"
+check    "cd .. at / stays at /"           "cd /\ncd ..\npwd"                  "/"
+check    "cd /// is /"                     "cd ///\npwd"                       "/"
+check    "cd (no args) goes to \$HOME"     "cd /\ncd\npwd"                     "$BASE"
+check    "cd ~ goes to \$HOME"             "cd /\ncd ~\npwd"                   "$BASE"
+check    "cd ~/work"                       "cd /\ncd ~/work\npwd"              "$R"
+check    "cd - returns and prints"         "mkdir a\ncd a\ncd /\ncd -\npwd"   "$R/a"$'\n'"$R/a"
+check    "cd absolute path"                "mkdir -p a/b\ncd $W/a/b\npwd"      "$R/a/b"
+check    "cd missing absolute path"        "cd /no/such/dir"                   "cd: /no/such/dir: No such file or directory"
+check    "\$PWD follows cd"                'mkdir a\ncd a\necho $PWD'          "$R/a"
+check    "cd symlinked folder"             "cd lnk\npwd"                       "$R/real"           "mkdir real; ln -s real lnk"
+contains "ls .. lists the parent"          "ls .."                             "decoy.txt"
+contains "ls -l /usr/bin (docx example)"   "ls -l /usr/bin"                    "-rwx"
+check    "ls /usr/bin | grep -x ls"        "ls /usr/bin | grep -x ls"          "ls"
+check    "cat ../file"                     "cat ../decoy.txt"                  "secret"
+check    "cat absolute path"               "cat $BASE/decoy.txt"               "secret"
+check    "cat ~/file"                      "cat ~/decoy.txt"                   "secret"
+check    "cat through a file symlink"      "cat fl"                            "secret"            "ln -s $BASE/decoy.txt fl"
+check    "cp ../file here"                 "cp ../decoy.txt x.txt\ncat x.txt"  "secret"
+check    "cp into the parent folder"       "cp a.txt ../x.txt"                 ""                  "echo hi > a.txt"
+fact     "  copy exists"                   "[ \"\$(cat $BASE/x.txt)\" = hi ]"
+check    "mv into the parent folder"       "mv a.txt ../x.txt"                 ""                  "echo hi > a.txt"
+fact     "  moved"                         "[ ! -e a.txt ] && [ -f $BASE/x.txt ]"
+check    "touch ../x"                      "touch ../x"                        ""
+fact     "  created"                       "[ -f $BASE/x ]"
+check    "> and < with ../"                "echo hi > ../out\ncat < ../out"    "hi"
+check    "external program with .."        "wc -l ../decoy.txt"                "1 ../decoy.txt"
+
+echo; echo "== 1b. Safety =="
 check    "rm . refused"                    "rm ."                              "rm: refusing to remove '.' or '..' directory: skipping '.'"
-check    "rm / refused"                    "rm -r /"                           "rm: refusing to remove the root directory '/'"
-check    "rm folder that holds cwd refused" "mkdir a\ncd a\nrm /a"             "rm: cannot remove '/a': current directory is inside it"
+check    "rm -r .. refused"                "rm -r .."                          "rm: refusing to remove '.' or '..' directory: skipping '..'"
+fact     "  parent untouched"              "[ -f $BASE/decoy.txt ]"
+check    "rm -r / refused"                 "rm -r /"                           "rm: refusing to remove the root directory '/'"
+check    "rm -r // refused"                "rm -r //"                          "rm: refusing to remove the root directory '/'"
 check    "mv / refused"                    "mv / x"                            "mv: cannot move the root directory"
-check    "symlink escape: cd blocked"      "cd esc"                            "cd: esc: $DENY"       "ln -s $BASE esc"
-check    "symlink escape: ls blocked"      "ls esc"                            "ls: esc: $DENY"       "ln -s $BASE esc"
-check    "symlink escape: cat blocked"     "cat esc/decoy.txt"                 "cat: esc/decoy.txt: $DENY" "ln -s $BASE esc"
-check    "symlink escape: cp into blocked" "cp a.txt esc"                      "cp: esc: $DENY"       "ln -s $BASE esc; echo hi > a.txt"
-check    "symlink escape: redirect blocked" "echo hi > esc/out"                "myshell: esc/out: $DENY" "ln -s $BASE esc"
-fact     "  nothing written outside"       "[ ! -e $BASE/out ]"
-check    "dangling symlink out blocked"    "touch dl"                          "touch: dl: $DENY"     "ln -s $BASE/newfile dl"
-fact     "  nothing created outside"       "[ ! -e $BASE/newfile ]"
-check    "symlink inside root works"       "cd lnk\npwd"                       "$R/real"                "mkdir real; ln -s real lnk"
-check    "redirect > ../out blocked"       "echo hi > ../out"                  "myshell: ../out: $DENY"
-fact     "  nothing written outside"       "[ ! -e $BASE/out ]"
-check    "redirect < ../decoy blocked"     "cat < ../decoy.txt"                "myshell: ../decoy.txt: $DENY"
-check    "external: /bin/ls .. blocked"    "/bin/ls .."                        "/bin/ls: ..: $DENY"
-check    "external: wc ../decoy blocked"   "wc -l ../decoy.txt"                "wc: ../decoy.txt: $DENY"
-check    "external: /x maps into root"     "/bin/cat /f.txt"                   "inside"               "echo inside > f.txt"
-check    "external: ../script blocked"     "../evil.sh"                        "myshell: ../evil.sh: $DENY"
+check    "rm folder that holds cwd refused" "mkdir a\ncd a\nrm -r $W/a"        "rm: cannot remove '$W/a': current directory is inside it"
+check    "rm a symlink removes the link"   "rm esc\nls"                        ""                  "ln -s $BASE esc"
+fact     "  its target is untouched"       "[ -f $BASE/decoy.txt ]"
+check    "rm -r never follows a symlink"   "rm -r d\nls"                       ""                  "mkdir d; ln -s $BASE d/esc"
+fact     "  linked folder untouched"       "[ -f $BASE/decoy.txt ]"
+check    "mv a symlink moves the link"     "mv fl g\nls\ncat g"                $'g\nsecret'        "ln -s $BASE/decoy.txt fl"
 
 echo; echo "== 2. pwd / cd errors =="
 check    "pwd in nested dir"               "mkdir -p x/y\ncd x\ncd y\npwd"     "$R/x/y"
 check    "cd missing dir"                  "cd nodir"                          "cd: nodir: No such file or directory"
 check    "cd into a file"                  "cd f.txt"                          "cd: f.txt: Not a directory"  "touch f.txt"
 check    "cd too many args"                "mkdir a b\ncd a b\npwd"            "cd: too many arguments"$'\n'"$R"
+check    "cd \"\" stays in place"           'mkdir a\ncd a\ncd ""\npwd'          "$R/a"
 
 echo; echo "== 3. ls =="
 check    "ls empty dir"                    "ls"                                ""
 check    "ls sorted, dirs marked /"        "ls"                                $'a.txt\nb.txt\nc/'  "touch b.txt a.txt; mkdir c"
 check    "ls hides hidden files"           "ls"                                "v"                  "touch .hid v"
-check    "ls -a at root (no ..)"           "ls -a"                             $'.\n.hid'           "touch .hid"
+check    "ls -a shows . and .."            "ls -a"                             $'.\n..\n.hid'       "touch .hid"
 check    "ls -a in subdir shows .."        "mkdir d\ncd d\nls -a"              $'.\n..'
 check    "ls a file"                       "ls f.txt"                          "f.txt"              "touch f.txt"
 check    "ls subdir path"                  "ls a/b"                            "c.txt"              "mkdir -p a/b; touch a/b/c.txt"
@@ -258,8 +256,14 @@ contains "meminfo available"               "meminfo"                           "
 contains "meminfo used"                    "meminfo"                           "MemUsed"
 
 echo; echo "== 13. help / history =="
-contains "help lists cd"                   "help"                              "cd [dir|-|~|/]"
+contains "help lists cd"                   "help"                              "cd [dir|-|~|..]"
 contains "help lists operators"            "help"                              "Operators:"
+contains "help cd page"                    "help cd"                           "system calls: chdir()"
+contains "help ls page"                    "help ls"                           "opendir(), readdir(), closedir(), stat()"
+contains "help several pages"              "help cp mv"                        "system calls: rename()"
+check    "help unknown topic"              "help nosuch\necho \$?"              $'help: no help topic for \'nosuch\'\n1'
+contains "help in a pipe"                  "help ls | cat"                     "usage : ls"
+check    "no banner or prompt when piped"  "echo ok"                           "ok"
 check    "history"                         "echo a\necho b\nhistory"           $'a\nb\n    1  echo a\n    2  echo b\n    3  history'
 check    "history N"                       "echo a\necho b\nhistory 1"         $'a\nb\n    3  history 1'
 check    "!! repeats last"                 "echo hi\n!!"                       $'hi\necho hi\nhi'
@@ -309,7 +313,7 @@ check    "syntax: ls | | cat"              "ls | | cat"                        "
 check    "syntax: ls |"                    "ls |"                              "myshell: syntax error: missing command"
 check    "syntax: ls & ls"                 "ls & ls"                           "myshell: syntax error near unexpected token \`&'"
 check    "syntax: > >"                     "echo > > f"                        "myshell: syntax error near unexpected token \`>'"
-fresh; start=$(date +%s%N); (cd "$JAIL" && printf 'sleep 2 &\necho done\n' | "$SHELL_BIN" > "$BASE/bg.out" 2>&1); end=$(date +%s%N)
+fresh; start=$(date +%s%N); (cd "$WORK" && printf 'sleep 2 &\necho done\n' | "$SHELL_BIN" > "$BASE/bg.out" 2>&1); end=$(date +%s%N)
 out=$(cat "$BASE/bg.out")
 if [ $(( (end - start) / 1000000 )) -lt 1500 ] && echo "$out" | grep -q "^\[1\] [0-9]*$" && echo "$out" | grep -q "^done$"; then
     ok "background does not block"
@@ -320,10 +324,10 @@ contains "background Done message"        "sleep 0.2 &\n/bin/sleep 0.5\necho x" 
 contains "background with redirect"       "echo bg > b.txt &\n/bin/sleep 0.3"  "Done (status 0)    echo"
 fact     "  background job wrote file"     '[ "$(cat b.txt)" = bg ]'
 
-echo; echo "== 17. Corner cases from run_tests.sh =="
-check    "relative symlink .. : cd blocked" "cd escape_link"                   "cd: escape_link: $DENY"   "ln -s .. escape_link"
-check    "relative symlink .. : ls blocked" "ls escape_link"                   "ls: escape_link: $DENY"   "ln -s .. escape_link"
-check    "relative symlink .. : cat blocked" "cat escape_link/decoy.txt"       "cat: escape_link/decoy.txt: $DENY" "ln -s .. escape_link"
+echo; echo "== 17. Extra corner cases =="
+check    "relative symlink .. : cd"        "cd up\npwd"                        "$BASE"            "ln -s .. up"
+contains "relative symlink .. : ls"        "ls up"                             "decoy.txt"        "ln -s .. up"
+check    "relative symlink .. : cat"       "cat up/decoy.txt"                  "secret"           "ln -s .. up"
 check    "pipe without spaces"             "echo piped|cat"                    "piped"
 check    "built-in on left of pipe"        "history | cat"                     "    1  history | cat"
 check    "< and > with a pipe"             "cat < s.txt | cat > out.txt"       ""                   "printf 'line one\nline two\n' > s.txt"
@@ -343,11 +347,102 @@ check    "two pipes work"                  "ls | cat | cat"                    $
 
 echo; echo "== 18. Assignment rules =="
 if grep -qE 'system\(|popen\(' "$SRC"; then bad "no system()/popen() in main.c" "grep" "none" "found"; else ok "no system()/popen() in main.c"; fi
+for f in realpath lstat readlink getpid setenv dup; do
+    if grep -qE "(^|[^a-z_0-9])$f\(" "$SRC"; then bad "does not use $f()" "grep" "none" "found"; else ok "does not use $f()"; fi
+done
 if [ -z "$WARN" ]; then ok "compiles with -Wall and no warnings"; else bad "compiles with -Wall and no warnings" "gcc" "no output" "$WARN"; fi
 for f in fork execvp waitpid pipe dup2 getcwd chdir opendir readdir closedir stat mkdir rmdir unlink rename open read write close utimensat getuid getpwuid uname; do
     if grep -q "\b$f(" "$SRC"; then ok "uses $f()"; else bad "uses $f()" "grep" "$f(" "missing"; fi
 done
 
+echo; echo "== 19. Error handling: file access, exec, signals =="
+if [ "$(id -u)" != 0 ]; then        # root ignores file permissions, so these only run as a normal user
+check    "cat unreadable file"             "cat locked"                        "cat: locked: Permission denied"   "echo s > locked; chmod 000 locked"
+check    "cp unreadable source"            "cp locked x"                       "cp: cannot open 'locked' for reading: Permission denied" "echo s > locked; chmod 000 locked"
+check    "< unreadable file"               "cat < locked"                      "myshell: locked: Permission denied" "echo s > locked; chmod 000 locked"
+check    "mkdir in read-only folder"       "mkdir ro/x"                        "mkdir: cannot create directory 'ro/x': Permission denied" "mkdir ro; chmod 555 ro"
+check    "touch in read-only folder"       "touch ro/x"                        "touch: cannot touch 'ro/x': Permission denied" "mkdir ro; chmod 555 ro"
+check    "rm in read-only folder"          "rm ro/f"                           "rm: cannot remove 'ro/f': Permission denied" "mkdir ro; touch ro/f; chmod 555 ro"
+check    "> in read-only folder"           "echo hi > ro/f"                    "myshell: ro/f: Permission denied" "mkdir ro; chmod 555 ro"
+check    "cd into folder without x"        "cd nx"                             "cd: nx: Permission denied"        "mkdir nx; chmod 000 nx"
+check    "ls folder without r"             "ls nr"                             "ls: cannot open directory 'nr': Permission denied" "mkdir nr; chmod 000 nr"
+else
+    echo "(running as root: permission tests skipped)"
+fi
+check    "> to a directory"                "echo hi > d"                       "myshell: d: Is a directory"       "mkdir d"
+check    "> into missing folder"           "echo hi > no/f"                    "myshell: no/f: No such file or directory"
+check    "mv into missing folder"          "mv a no/b"                         "mv: cannot move 'a' to 'no/b': No such file or directory" "touch a"
+check    "non-executable file gives 126"   "./s.sh\necho \$?"                  $'./s.sh: Permission denied\n126'  "echo 'echo hi' > s.sh; chmod 644 s.sh"
+check    "executable script runs"          "./s.sh"                            "hi"                 "printf '#!/bin/sh\necho hi\n' > s.sh; chmod 755 s.sh"
+check    "killed by signal gives 128+9"    'sh -c "kill -9 \$\$"\necho $?'     "137"
+check    "exit status of external"         "false\necho \$?\ntrue\necho \$?"   $'1\n0'
+status   "\$? is 2 after a syntax error"    "ls >\nexit"                        2
+
+echo; echo "== 20. More edge cases =="
+status   "exit -1 gives 255"               "exit -1"                           255
+check    "exit in a pipe keeps the shell"  "exit | cat\necho alive"            "alive"
+check    "builtin redirect restores stdout" "echo a > f\necho b\ncat f"        $'b\na'
+check    "cd with a redirect"              "cd d > out.txt\npwd"               "$R/d"               "mkdir d"
+check    "history 0 prints nothing"        "history 0"                         ""
+check    "history -1 is an error"          "history -1"                        "history: -1: numeric argument required"
+check    "!N with extra arguments"         "echo a\n!1 b"                      $'a\necho a b\na b'
+H=$(for i in $(seq 105); do printf 'echo %s\\n' "$i"; done)
+contains "history keeps numbering past 100" "${H}history 2"                   "  106  history 2"
+contains "history forgets entries past 100" "${H}!1"                          "myshell: !1: event not found"
+check    "operators inside quotes"         "echo \"a|b > c\" 'd & e'"          "a|b > c d & e"
+check    "comment after a command"         "echo hi # not printed"             "hi"
+check    "empty quoted argument"           'echo "" x'                         " x"
+check    "echo -n alone"                   "echo -n\necho x"                   "x"
+check    "uname -s -m (separate flags)"    "uname -s -m"                       "$(uname -s) $(uname -m)"
+contains "uname table: node name"          "uname"                             "Node Name   : $(uname -n)"
+contains "uname table: release"            "uname"                             "Release     : $(uname -r)"
+matches  "uptime numbers"                  "uptime"                            '^Uptime       : [0-9]+ days, [0-9]+ hours, [0-9]+ minutes, [0-9]+ seconds$'
+matches  "load average numbers"            "uptime"                            '^Load average : [0-9]+\.[0-9]{2} \(1 min\), [0-9]+\.[0-9]{2} \(5 min\), [0-9]+\.[0-9]{2} \(15 min\)$'
+matches  "meminfo MemTotal = /proc/meminfo" "meminfo"                          "^MemTotal *: +$(awk '/^MemTotal:/{print $2}' /proc/meminfo) kB"
+check    "mv several into a folder"        "mv a b dir\nls dir"                $'a\nb'              "touch a b; mkdir dir"
+check    "mv several, target not a folder" "mv a b c"                          "mv: target 'c' is not a directory" "touch a b"
+check    "mv overwrites"                   "mv n o\ncat o\nls"                 $'new\no'            "echo new > n; echo old > o"
+check    "cat - between files"             "echo mid | cat a - b"              $'A\nmid\nB'         "echo A > a; echo B > b"
+check    "touch makes mode 644"            "touch t"                           ""
+fact     "  mode is 644"                   '[ "$(stat -c %a t)" = 644 ]'
+check    ">> creates a missing file"       "echo a >> n.txt\ncat n.txt"        "a"
+check    "> a > b: both made, output in b" "echo a > f1 > f2\ncat f2"          "a"
+fact     "  f1 exists and is empty"        "[ -f f1 ] && [ ! -s f1 ]"
+check    "< missing stops > from running"  "cat < nope > f3"                   "myshell: nope: No such file or directory"
+fact     "  f3 not created"                "[ ! -e f3 ]"
+P16="echo x$(printf ' | cat%.0s' {1..15})"
+check    "16-command pipeline works"       "$P16"                              "x"
+check    "17 commands: too many pipes"     "$P16 | cat"                        "myshell: too many pipes (max 16 commands)"
+contains "two background jobs numbered"    "sleep 0.1 &\nfalse &\n/bin/sleep 0.4\necho x" "[2] Done (status 1)    false"
+
+echo; echo "== 21. No system binaries: all 14 commands work with an empty PATH =="
+fresh; out=$(cd "$WORK" && printf 'mkdir d\ntouch d/f\necho hi > d/f\ncp d/f d/g\nmv d/g d/h\ncat d/h\nls d\nrm d/f d/h\nrm -r d\npwd\nwhoami\nuname -s\nuptime\nmeminfo\necho ok\nwc\n' | PATH= "$SHELL_BIN" 2>&1)
+exp=$(printf 'hi\nf\nh\n%s\n%s\n%s\n' "$R" "$(id -un)" "$(uname -s)")
+if [ "$(printf '%s\n' "$out" | head -6)" = "$exp" ]; then ok "file commands, pwd, whoami, uname with PATH empty"; else bad "file commands, pwd, whoami, uname with PATH empty" "PATH= myshell" "$exp" "$out"; fi
+if printf '%s' "$out" | grep -q "^Uptime" && printf '%s' "$out" | grep -q "^MemTotal"; then ok "uptime and meminfo with PATH empty"; else bad "uptime and meminfo with PATH empty" "PATH= myshell" "Uptime/MemTotal lines" "$out"; fi
+if printf '%s\n' "$out" | tail -2 | tr '\n' '|' | grep -qx "ok|wc: command not found|"; then ok "a real program (wc) is not found: nothing else is run"; else bad "a real program (wc) is not found" "PATH= myshell" "ok, wc: command not found" "$out"; fi
+
+echo; echo "== 22. Interactive: prompt, banner, Ctrl+C =="
+if command -v script >/dev/null 2>&1; then
+    fresh; out=$(cd "$WORK" && { printf 'cat nope\nexit\n'; sleep 0.5; } | script -qc "$SHELL_BIN" /dev/null 2>&1 | sed 's/\x1b\[[0-9;]*m//g')
+    if printf '%s' "$out" | grep -q "Type help for commands"; then ok "banner on a terminal"; else bad "banner on a terminal" "(terminal)" "banner" "$out"; fi
+    if printf '%s' "$out" | grep -qF "myshell> "; then ok "prompt is exactly myshell> "; else bad "prompt is exactly myshell> " "(terminal)" "myshell> " "$out"; fi
+    if ! printf '%s' "$out" | grep -qE "myshell[^>]+> |$(id -un)@"; then ok "prompt has nothing else (no folder, no user@host)"; else bad "prompt has nothing else" "(terminal)" "only myshell> " "$out"; fi
+    if printf '%s' "$out" | grep -q "cat: nope: No such file or directory"; then ok "loop keeps running after an error"; else bad "loop keeps running after an error" "(terminal)" "error then prompt" "$out"; fi
+else
+    echo "(script command not found: terminal tests skipped)"
+fi
+fresh; rm -f "$BASE/fifo"; mkfifo "$BASE/fifo"
+(cd "$WORK" && exec "$SHELL_BIN" < "$BASE/fifo" > "$BASE/sig.out" 2>&1) & spid=$!
+exec 3>"$BASE/fifo"
+sleep 0.2; kill -INT "$spid"                             # Ctrl+C at the prompt
+printf 'sleep 5\n' >&3; sleep 0.4; pkill -INT -P "$spid" # Ctrl+C while a command runs
+printf 'echo st=$?\necho alive\nexit\n' >&3; exec 3>&-
+wait "$spid"; out=$(cat "$BASE/sig.out")
+if printf '%s' "$out" | grep -q "^alive$"; then ok "Ctrl+C does not kill the shell"; else bad "Ctrl+C does not kill the shell" "SIGINT" "alive" "$out"; fi
+if printf '%s' "$out" | grep -q "^st=130$"; then ok "Ctrl+C stops the running command (status 130)"; else bad "Ctrl+C stops the running command" "SIGINT to sleep" "st=130" "$out"; fi
+
+[ -d "$WORK" ] && chmod -R u+rwx "$WORK" 2>/dev/null
 rm -rf "$BASE"
 echo
 echo "Passed: $PASS   Failed: $FAIL"
