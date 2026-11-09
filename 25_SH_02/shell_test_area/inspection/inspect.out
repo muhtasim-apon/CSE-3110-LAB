@@ -1,0 +1,31 @@
+listed.txt  inspect.out  folder  inspect.err  
+-rw-rw-r--        4 listed.txt
+-rw-rw-r--       47 inspect.out
+drwxrwxr-x     4096 folder
+-rw-rw-r--        0 inspect.err
+muhtasim
+System Name : Linux
+Node Name   : muhtasim-HP-Pavilion-Laptop-15-eg3xxx
+Release     : 7.0.0-38-generic
+Version     : #38~24.04.4-Ubuntu SMP PREEMPT_DYNAMIC Mon Sep 14 16:37:11 UTC 2
+Machine     : x86_64
+Uptime: 0 days, 0 hours, 7 minutes, 13 seconds
+Load average: 1.15 0.91 0.45
+MemTotal:       16004104 kB
+MemFree:         9974168 kB
+MemAvailable:   11994552 kB
+Buffers:           84292 kB
+Cached:          2777592 kB
+SwapTotal:       4194300 kB
+SwapFree:        4194300 kB
+Custom Shell Commands
+  pwd, ls [-l] [dir], cd [dir], whoami, uname
+  mkdir dir, touch file, rm path, cp src dst, mv src dst
+  cat [file], echo text/$VAR, uptime, meminfo
+  help, history, exit [status]
+  cmd1 | cmd2 | cmd3       multiple pipes
+  command < file           input redirection
+  command > file           output redirection
+  command >> file          append redirection
+  command &                background execution
+  / is the folder where myshell was started

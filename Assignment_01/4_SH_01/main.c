@@ -1,5 +1,6 @@
 /* myshell - a custom UNIX-like shell (CSE-3110 OS Lab, Assignment 1)
  * Every command is written with the POSIX system calls named in the assignment. */
+#define _GNU_SOURCE                 //turns on O_PATH and the other GNU extras; must come before every #include
 #include<stdio.h>                   //printf, fprintf, fgets, perror, snprintf
 #include<stdlib.h>                  //malloc, realloc, free, exit, getenv, strtol, qsort
 #include<string.h>                  //strcmp, strlen, strchr, strerror, strdup, memset
@@ -16,6 +17,9 @@
 #include<sys/stat.h>                //stat, mkdir, utimensat, S_ISDIR
 #include<sys/wait.h>                //waitpid and WIFEXITED / WEXITSTATUS macros
 #include<sys/utsname.h>             //uname and struct utsname
+#include<sys/prctl.h>               //prctl for PR_SET_NO_NEW_PRIVS, needed before the sandbox starts
+#include<sys/syscall.h>             //syscall(): the Landlock calls have no C library wrapper
+#include<stdint.h>                  //uint64_t, int32_t: exact sizes the Landlock structures need
 #define MAX_LINE 1024               //longest input line (including newline and '\0')
 #define MAX_ARGS 64                 //most words in one command (+1 slot for the NULL end)
 #define MAX_CMDS 16                 //most commands joined by pipes in one line
@@ -31,9 +35,18 @@
 #define C_BOLD  "\033[1m"           //bold text
 #define C_RED   "\033[1;31m"        //bold red: "$" after a failed command
 #define C_CYAN  "\033[1;36m"        //bold cyan: shell name and banner
+#define LL_CREATE 444               //system call number of landlock_create_ruleset
+#define LL_ADD 445                  //system call number of landlock_add_rule
+#define LL_RESTRICT 446             //system call number of landlock_restrict_self
+#define LL_EXEC 1ULL                //right: run files
+#define LL_WRITE 2ULL               //right: write files
+#define LL_READ 4ULL                //right: read files
+#define LL_ALL_V1 ((1ULL<<13)-1)    //all 13 rights of Landlock version 1
+#define LL_REFER (1ULL<<13)         //version 2 right: link or move a file to another folder
+#define LL_TRUNCATE (1ULL<<14)      //version 3 right: cut a file to a new size
 
 char prevdir[PATH_MAX];     //previous directory, for "cd -"
-char start_dir[PATH_MAX];           //folder where myshell was started (shown by its name, e.g. 4_SH_01)
+char start_dir[PATH_MAX];           //folder where myshell was started: the root of the jail (shown by its name, e.g. 4_SH_01)
 size_t start_len=0;                 //length of start_dir (0 = started in "/", nothing to shorten)
 int last_status=0;          //exit status of the last command, for $? and exit
 char *history[HIST_SIZE];           //ring buffer of the last commands typed
@@ -41,6 +54,95 @@ int hist_total=0;                   //how many commands were ever added (gives h
 struct {pid_t pid;int num;char name[64];} jobs[MAX_JOBS];   //running background jobs: pid, job number, command name
 int job_count=0;                    //last job number handed out ([1], [2], ...)
 volatile sig_atomic_t at_prompt=0;  //1 while the shell waits for input (Ctrl+C then moves to a new line)
+struct ll_attr {uint64_t handled;}; //Landlock ruleset: the rights it controls
+struct ll_rule {uint64_t allowed;int32_t fd;} __attribute__((packed));   //Landlock rule: rights allowed below the folder open on fd
+
+/*
+ * ========================== OVERALL EXECUTION ORDER ==========================
+ *
+ * 1. STARTUP (main)
+ *    - getcwd() saves the start folder. It becomes the root of the shell's jail.
+ *    - TMPDIR points at the start folder, because /tmp is blocked for programs.
+ *    - sigaction() installs on_sigint, so Ctrl+C cannot kill the shell.
+ *    - On a terminal, the banner is printed.
+ *
+ * 2. READ-EXECUTE LOOP (main repeats these steps until exit or Ctrl+D)
+ *
+ *    reap_jobs()        report background jobs that have finished
+ *        |
+ *    print the prompt   "myshell> ", only on a terminal
+ *        |
+ *    fgets()            read one line; Ctrl+D leaves the loop
+ *        |
+ *    hist_expand()      replace !! and !N with the saved command
+ *        |
+ *    hist_add()         save the line in the history ring
+ *        |
+ *    tokenize()         line -> tokens (words and | < > >> &)
+ *        |              expands quotes, \x, $VAR, ${VAR} and $? (expand_var)
+ *    parse()            tokens -> Cmd array, one Cmd per piped command
+ *        |
+ *    execute()          run the commands and wait for them
+ *        |
+ *    last_status        kept for $? and for the prompt colour
+ *
+ * 3. INSIDE execute()
+ *
+ *    A. Single builtin (cd, echo, exit, help, history) without '&'
+ *       save stdin/stdout -> redirect() -> run the function in the shell itself
+ *       -> restore stdin/stdout.
+ *       It must run in the shell: a child's "cd" would not change the shell.
+ *
+ *    B. Everything else
+ *       for each command:
+ *           pipe()   a pipe to the next command (not after the last one)
+ *           fork()   a child process
+ *           child:   connect the pipes with dup2(), then child_run()
+ *           parent:  close the pipe ends it does not need
+ *       then:
+ *           background ('&'): save the job, print [n] pid, return at once
+ *           foreground:       waitpid() for every child;
+ *                             the last command decides the exit status
+ *
+ * 4. INSIDE child_run() (the child process, it never returns)
+ *
+ *    find_command()       look the name up in the commands[] table
+ *        |
+ *    redirect()           apply < > >> with open() and dup2()
+ *        |
+ *        +-- found:       run our own xxx_call() function, then _exit(status)
+ *        |
+ *        +-- not found:   external program
+ *                         expand_path() checks every argument
+ *                         jail_program() starts the Landlock sandbox
+ *                         execvp() replaces the child with the program
+ *                         a failed execvp() gives status 127 or 126
+ *
+ * 5. THE JAIL (nothing outside the start folder can be reached)
+ *
+ *    Our own commands: every path goes through
+ *        expand_path() or expand_link() -> expand_jail() -> expand_home()
+ *        + jail_ok() -> realpath() -> below_root()
+ *    External programs: the same argument check, then the kernel sandbox
+ *        jail_program() -> ll_allow(), which also stops paths the program
+ *        opens by itself (for example: sh -c "cat /etc/passwd").
+ *
+ * 6. EXAMPLE: cat a.txt | wc -l > b.txt
+ *
+ *    tokenize  WORD(cat) WORD(a.txt) PIPE WORD(wc) WORD(-l) OUT WORD(b.txt)
+ *    parse     cmd[0] = cat a.txt
+ *              cmd[1] = wc -l, with the redirection > b.txt
+ *    execute   pipe(), then two children:
+ *      child 0 stdout = pipe write end -> child_run -> cat_call -> _exit
+ *      child 1 stdin  = pipe read end  -> child_run -> redirect (stdout = b.txt)
+ *              -> argument check -> jail_program -> execvp("wc")
+ *    parent    closes both pipe ends, waits for both children;
+ *              the status of wc becomes last_status.
+ *
+ * 7. SHUTDOWN
+ *    exit_call() ends the process directly. At end of input (Ctrl+D) main leaves
+ *    the loop and returns last_status.
+ */
 
 /* ============ Helpers ============ */
 
@@ -74,7 +176,7 @@ const char *show_path(const char *real)   //real path -> text shown to the user
 }                                   //end of show_path
 //"~" and "~/x" become the home folder ($HOME); any other path is passed on unchanged
 //returns 0 ok, -1 error (message printed for command cmd)
-int expand_path(const char *cmd,const char *path,char *out)   //expand "~", copy path into out
+int expand_home(const char *cmd,const char *path,char *out)   //expand "~", copy path into out (no jail check here)
 {                                   //start of expand_path
     const char *home=getenv("HOME");    //home folder from the environment
     if(home==NULL||home[0]=='\0')home="/";  //no HOME set: use "/" instead
@@ -96,7 +198,109 @@ int expand_path(const char *cmd,const char *path,char *out)   //expand "~", copy
     }                               //end of error case
     snprintf(out,PATH_MAX,"%s",path);   //any other path is copied unchanged; the kernel resolves it
     return 0;                       //success
+}                                   //end of expand_home
+//the jail test: real must already be resolved by realpath(); returns 1 inside, 0 outside
+int below_root(const char *real)    //is this resolved path the start folder or inside it?
+{                                   //start of below_root
+    if(start_len==0)return 1;       //started in "/": everything is inside
+    if(strncmp(real,start_dir,start_len)!=0)return 0;   //does not start with the start folder: outside
+    return real[start_len]=='\0'||real[start_len]=='/';   //full name match only ("4_SH_01x" is outside)
+}                                   //end of below_root
+//resolve the path (realpath follows "..", "." and links) and test it with below_root()
+//a path that does not exist yet is judged by its deepest parent that does exist
+//follow=0: the last name itself is not followed (rm and mv act on a link, not its target)
+int jail_ok(const char *path,int follow)   //may this path be used? 1 yes, 0 no
+{                                   //start of jail_ok
+    char cur[PATH_MAX],res[PATH_MAX],*cut;   //path being tested, resolved path, position of the last '/'
+    const char *name;               //last name of cur
+    size_t len;                     //length of cur
+    int fd;                         //fd for testing a broken link
+    snprintf(cur,sizeof(cur),"%s",path);   //work on a copy, it is cut below
+    while(1)                        //walk up the path until one part can be resolved
+    {                               //start of walk loop
+        if(follow)                  //resolve this part (skipped once for follow=0)
+        {                           //start of resolve case
+            if(realpath(cur,res)!=NULL)return below_root(res);   //it exists: the resolved path gives the answer
+            fd=open(cur,O_RDONLY|O_NOFOLLOW|O_NONBLOCK);   //why did it fail? open it without following a link
+            if(fd<0&&errno==ELOOP)return 0;   //a broken link: its target could be anywhere, refuse
+            if(fd>=0)close(fd);     //only a test, close it again
+        }                           //end of resolve case
+        follow=1;                   //every parent folder is always followed
+        len=strlen(cur);            //length before cutting
+        while(len>1&&cur[len-1]=='/')cur[--len]='\0';   //drop trailing '/' ("a/b/" is "a/b")
+        if(strcmp(cur,".")==0)return 0;   //even the current folder cannot be resolved: refuse
+        cut=strrchr(cur,'/');       //find the last '/'
+        name=cut?cut+1:cur;         //the last name of the path
+        if(strcmp(name,"..")==0)return 0;   //an unresolved "..": cannot be judged, refuse
+        if(cut==NULL)strcpy(cur,".");   //plain name: its parent is the current folder
+        else if(cut==cur)cur[1]='\0';   //"/x": its parent is the root
+        else *cut='\0';             //"a/b": its parent is "a"
+    }                               //end of walk loop
+}                                   //end of jail_ok
+//expand "~", then refuse anything outside the start folder; returns 0 ok, -1 refused
+int expand_jail(const char *cmd,const char *path,char *out,int follow)   //expand "~", then check the jail
+{                                   //start of expand_jail
+    if(expand_home(cmd,path,out)!=0)return -1;   //handle "~"; a too long path already printed its error
+    if(jail_ok(out,follow))return 0;   //inside the jail: path is ready
+    fprintf(stderr,"%s: %s: access denied (outside %s)\n",cmd,path,base_name(start_dir));   //report the refused path
+    return -1;                      //failure
+}                                   //end of expand_jail
+//the check used by nearly every command: the path and all its links must stay inside
+int expand_path(const char *cmd,const char *path,char *out)   //normal path: links are followed
+{                                   //start of expand_path
+    return expand_jail(cmd,path,out,1);   //follow=1
 }                                   //end of expand_path
+//used by rm and mv: they work on the link itself, so a link to the outside may be removed
+int expand_link(const char *cmd,const char *path,char *out)   //path of a link: the last name is not followed
+{                                   //start of expand_link
+    return expand_jail(cmd,path,out,0);   //follow=0
+}                                   //end of expand_link
+//ask the kernel which Landlock version it has (flag 1 = return the version)
+int landlock_version(void)          //Landlock version of this kernel; below 1 = no Landlock
+{                                   //start of landlock_version
+    return (int)syscall(LL_CREATE,NULL,0,1);   //system call: landlock_create_ruleset
+}                                   //end of landlock_version
+//add one rule to the ruleset; a path missing on this system (e.g. /lib64) is skipped
+void ll_allow(int rules,const char *path,uint64_t rights)   //allow rights below path
+{                                   //start of ll_allow
+    struct ll_rule rule;            //the rule given to the kernel
+    int fd=open(path,O_PATH|O_CLOEXEC);   //system call: O_PATH only names the folder for the rule
+    if(fd<0)return;                 //no such path: nothing to allow
+    rule.allowed=rights;            //what may be done there
+    rule.fd=fd;                     //the folder or file it applies to
+    if(syscall(LL_ADD,rules,1,&rule,0)!=0)perror("myshell: landlock rule");   //system call: landlock_add_rule (1 = rule for a path)
+    close(fd);                      //the kernel keeps its own reference
+}                                   //end of ll_allow
+//kernel sandbox for external programs: the argument check cannot see the paths a program
+//opens by itself (sh -c "cat /etc/passwd"), so here the kernel refuses them
+//the start folder gets every right; system folders can only be read and run
+int jail_program(void)              //put this child in the sandbox; 0 ok, -1 error
+{                                   //start of jail_program
+    int ver=landlock_version(),rules;   //Landlock version, fd of the ruleset
+    uint64_t all=LL_ALL_V1;         //every right this kernel knows
+    uint64_t dev=LL_READ|LL_WRITE;  //rights for the /dev files
+    struct ll_attr attr;            //describes the ruleset
+    if(ver<1)return 0;              //no Landlock: only the argument check protects us
+    if(ver>=2)all|=LL_REFER;        //version 2 knows this right too
+    if(ver>=3){all|=LL_TRUNCATE;dev|=LL_TRUNCATE;}   //version 3 also controls truncating, /dev needs it for "> /dev/null"
+    attr.handled=all;               //everything not allowed by a rule is refused
+    rules=(int)syscall(LL_CREATE,&attr,sizeof(attr),0);   //system call: landlock_create_ruleset
+    if(rules<0)return -1;           //could not create it
+    ll_allow(rules,start_dir,all);  //inside the start folder everything is allowed
+    ll_allow(rules,"/usr",LL_READ|LL_EXEC);   //programs and libraries: read and run only
+    ll_allow(rules,"/bin",LL_READ|LL_EXEC);   //programs
+    ll_allow(rules,"/lib",LL_READ|LL_EXEC);   //shared libraries
+    ll_allow(rules,"/lib64",LL_READ|LL_EXEC);   //shared libraries and the program loader
+    ll_allow(rules,"/etc/ld.so.cache",LL_READ);   //the loader finds libraries through this file
+    ll_allow(rules,"/dev/null",dev);   //discards output
+    ll_allow(rules,"/dev/zero",dev);   //endless zero bytes
+    ll_allow(rules,"/dev/urandom",dev);   //random bytes
+    ll_allow(rules,"/dev/tty",dev); //the terminal
+    if(prctl(PR_SET_NO_NEW_PRIVS,1,0,0,0)!=0)return -1;   //required: without it an unprivileged process may not start the sandbox
+    if(syscall(LL_RESTRICT,rules,0)!=0)return -1;   //system call: landlock_restrict_self, the sandbox is now on
+    close(rules);                   //the sandbox stays on without this fd
+    return 0;                       //program can now be started
+}                                   //end of jail_program
 
 /* ============ 1. File & Directory Inspection Commands ============ */
 
@@ -172,7 +376,7 @@ int ls_call(int argc,char *argv[])   //ls command
     if(ntarget==0)targets[ntarget++]=".";   //no path given: list the current folder
     for(i=0;i<ntarget;i++)          //list each target
     {                               //start of target loop
-        if(expand_path("ls",targets[i],real)!=0){ret=1;continue;}  //handle "~"; skip on error
+        if(expand_path("ls",targets[i],real)!=0){ret=1;continue;}  //handle "~", jail check; skip on error
         if(stat(real,&st)!=0)       //system call: does it exist, and what is it?
         {                           //start of error case
             fprintf(stderr,"ls: cannot access '%s': %s\n",targets[i],strerror(errno));    //e.g. No such file
@@ -323,7 +527,7 @@ int mkdir_call(int argc,char *argv[])   //mkdir command
     for(i=1;i<argc;i++)             //second pass: create each folder
     {                               //start of create loop
         if(strcmp(argv[i],"-p")==0)continue;   //skip the option itself
-        if(expand_path("mkdir",argv[i],real)!=0){ret=1;continue;}  //handle "~"
+        if(expand_path("mkdir",argv[i],real)!=0){ret=1;continue;}  //handle "~", jail check
         if((pflag?mkdir_parents(real):mkdir(real,0755))!=0)  //system call mkdir() with mode 0755
         {                           //start of error case
             fprintf(stderr,"mkdir: cannot create directory '%s': %s\n",argv[i],strerror(errno));     //e.g. File exists
@@ -344,7 +548,7 @@ int touch_call(int argc,char *argv[])   //touch command
     }                               //end of error case
     for(i=1;i<argc;i++)             //each file
     {                               //start of file loop
-        if(expand_path("touch",argv[i],real)!=0){ret=1;continue;}  //handle "~"
+        if(expand_path("touch",argv[i],real)!=0){ret=1;continue;}  //handle "~", jail check
         fd=open(real,O_WRONLY|O_CREAT|O_NONBLOCK,0644);    //system call: create if missing (mode 644), keep content
         if(fd<0&&errno!=EISDIR)     //failed, and not because it is a folder
         {                           //start of error case
@@ -425,7 +629,7 @@ int rm_call(int argc,char *argv[])   //rm command
             ret=1;                  //failure for this one
             continue;               //next path
         }                           //end of refuse case
-        if(expand_path("rm",argv[i],real)!=0){ret=1;continue;}     //handle "~"
+        if(expand_link("rm",argv[i],real)!=0){ret=1;continue;}   //handle "~", jail check (a link itself is not followed)
         len=strlen(real);           //length of the expanded path
         while(len>1&&real[len-1]=='/')real[--len]='\0';     //"//" is "/" too
         if(strcmp(real,"/")==0)     //safety: never remove the root folder
@@ -510,7 +714,7 @@ int cp_call(int argc,char *argv[])   //cp command
     }                               //end of error case
     for(i=1;i<argc-1;i++)           //copy each source
     {                               //start of source loop
-        if(expand_path("cp",argv[i],src)!=0){ret=1;continue;}  //handle "~"
+        if(expand_path("cp",argv[i],src)!=0){ret=1;continue;}  //handle "~", jail check
         if(stat(src,&ss)!=0)        //system call: source must exist
         {                           //start of error case
             fprintf(stderr,"cp: cannot stat '%s': %s\n",argv[i],strerror(errno));     //e.g. No such file
@@ -525,6 +729,12 @@ int cp_call(int argc,char *argv[])   //cp command
         }                           //end of error case
         if(isdir)snprintf(target,sizeof(target),"%s/%s",dst,base_name(src));  //into a folder: keep the file name
         else snprintf(target,sizeof(target),"%s",dst);  //otherwise copy to the given name
+        if(!jail_ok(target,1))      //a link inside the folder could still lead outside
+        {                           //start of error case
+            fprintf(stderr,"cp: %s: access denied (outside %s)\n",target,base_name(start_dir));   //report it
+            ret=1;                  //remember the failure
+            continue;               //next source
+        }                           //end of error case
         if(stat(target,&ds)==0&&ds.st_dev==ss.st_dev&&ds.st_ino==ss.st_ino)    //same device + inode = same file
         {                           //start of error case
             fprintf(stderr,"cp: '%s' and '%s' are the same file\n",argv[i],argv[argc-1]);     //copying would empty it
@@ -556,7 +766,7 @@ int mv_call(int argc,char *argv[])   //mv command
     }                               //end of error case
     for(i=1;i<argc-1;i++)           //move each source
     {                               //start of source loop
-        if(expand_path("mv",argv[i],src)!=0){ret=1;continue;}  //handle "~"
+        if(expand_link("mv",argv[i],src)!=0){ret=1;continue;}   //handle "~", jail check (a link itself is not followed)
         if(stat(src,&ss)!=0)        //system call: source must exist
         {                           //start of error case
             fprintf(stderr,"mv: cannot stat '%s': %s\n",argv[i],strerror(errno));     //e.g. No such file
@@ -629,7 +839,7 @@ int cat_call(int argc,char *argv[])   //cat command
             ret|=cat_fd(STDIN_FILENO,"stdin");     //copy stdin
             continue;               //next argument
         }                           //end of stdin case
-        if(expand_path("cat",argv[i],real)!=0){ret=1;continue;}    //handle "~"
+        if(expand_path("cat",argv[i],real)!=0){ret=1;continue;}    //handle "~", jail check
         fd=open(real,O_RDONLY);     //system call: open the file
         if(fd<0)                    //cannot open it
         {                           //start of error case
@@ -709,7 +919,7 @@ int meminfo_call(int argc,char *argv[])   //meminfo command
 
 /* ============ Built-in commands (run inside the shell process) ============ */
 
-//cd [dir | - | ~]: chdir(); getcwd() remembers the old folder for "cd -"
+//cd [dir | -]: chdir(); getcwd() remembers the old folder for "cd -"
 int cd_call(int argc,char *argv[])   //cd builtin
 {                                   //start of cd
     char real[PATH_MAX],old[PATH_MAX],back[PATH_MAX];  //target path, folder before cd, copy of prevdir
@@ -721,14 +931,14 @@ int cd_call(int argc,char *argv[])   //cd builtin
         return 1;                   //failure
     }                               //end of error case
     if(argc==2&&argv[1][0]=='\0')return 0;     //cd "" stays here, like bash
-    target=argc>1?argv[1]:"~";             //no argument: home folder
+    target=argc>1?argv[1]:start_dir;   //no argument: the start folder
     if(strcmp(target,"-")==0)       //"cd -": go back to the previous folder
     {                               //start of "cd -" case
         snprintf(back,sizeof(back),"%s",prevdir);  //copy it, prevdir changes below
         target=back;                //go there
         dash=1;                     //print it afterwards
     }                               //end of "cd -" case
-    if(expand_path("cd",target,real)!=0)return 1;  //handle "~" and "~/x"
+    if(expand_path("cd",target,real)!=0)return 1;  //handle "~" and "~/x", jail check
     if(getcwd(old,sizeof(old))==NULL)old[0]='\0';   //system call: remember where we are now
     if(chdir(real)!=0)          //ENOENT, ENOTDIR ("Not a directory"), EACCES ...
     {                               //start of error case
@@ -763,12 +973,12 @@ int exit_call(int argc,char *argv[])   //exit builtin
 }                                   //end of exit
 //one help page per command: usage, what it does, and the system calls behind it
 struct {const char *name,*usage,*info,*calls;} help_pages[]={  //table used by "help <command>"
-    {"cd","cd [dir | - | ~ | /]","Change the shell's directory. No argument or ~ = home folder, - = previous folder,\n  .. = parent folder.","chdir(), getcwd() (builtin, runs in the shell process)"},   //cd page
+    {"cd","cd [dir | -]","Change the shell's directory. No argument = start folder, - = previous folder,\n  .. = parent folder. Nothing above the start folder can be reached.","chdir(), getcwd() (builtin, runs in the shell process)"},   //cd page
     {"echo","echo [-n] text...","Print text. $VAR, ${VAR}, $PWD and $? are expanded; -n = no newline.","write() through stdout, getenv() (builtin)"},  //echo page
     {"exit","exit [n]","Leave the shell with status n (default: status of the last command).","exit() (builtin)"},  //exit page
     {"help","help [command]","Show the command list, or the help page of one command.","builtin"},     //help page
     {"history","history [n]","Show the last n commands (all if n is missing).\n  !! runs the last command again, !N runs command number N.","builtin, in-memory list"},    //history page
-    {"pwd","pwd","Print the current directory. Inside the start folder it is shown by\n  that folder's name (e.g. 4_SH_01/demo); above it, the full path.","getcwd()"},   //pwd page
+    {"pwd","pwd","Print the current directory, written from the start folder's name\n  (e.g. 4_SH_01/demo). The start folder is the root of this shell.","getcwd()"},   //pwd page
     {"ls","ls [-a] [-l] [path...]","List a directory. -a shows hidden files, -l the long format.\n  Folders end with /.","opendir(), readdir(), closedir(), stat()"},    //ls page
     {"whoami","whoami","Print the current user name.","getuid(), getpwuid()"},     //whoami page
     {"uname","uname [-a -s -n -r -v -m]","Print system name, host, kernel release, version and machine.","uname()"},    //uname page
@@ -803,7 +1013,7 @@ int help_call(int argc,char *argv[])   //help builtin
     }                               //end of page case
     printf("myshell - custom UNIX shell.\n\n");    //menu title
     printf("Built-in commands (run inside the shell process):\n");     //group: built-ins
-    printf("  cd [dir|-|~|..]     change directory (no argument = home folder)\n");    //cd line
+    printf("  cd [dir|-|..]       change directory (no argument = start folder)\n");   //cd line
     printf("  echo [-n] text      print text ($VAR, ${VAR}, $? are expanded)\n");     //echo line
     printf("  exit [n]            leave the shell with status n\n");  //exit line
     printf("  help [command]      show this help, or the help of one command\n");     //help line
@@ -822,7 +1032,8 @@ int help_call(int argc,char *argv[])   //help builtin
     printf("  uname [-asnrvm]     print system information\n");   //uname line
     printf("  uptime              system uptime and load average\n");     //uptime line
     printf("  meminfo             memory statistics\n\n");    //meminfo line
-    printf("Any other command is run with fork + execvp (e.g. wc, sort, grep).\n\n");  //external programs
+    printf("Any other command is run with fork + execvp (e.g. wc, sort, grep).\n");   //external programs
+    printf("The start folder is the root: nothing outside it can be reached.\n\n");   //the jail
     printf("Operators: cmd1 | cmd2   cmd > file   cmd >> file   cmd < file   cmd &\n");  //pipes, redirection, background
     printf("Quotes: \"text with $VAR\"  'literal text'  \\x escapes one character\n");  //quoting rules
     printf("Keys: Ctrl+C stops the running command, Ctrl+D leaves the shell.\n");  //keyboard keys
@@ -1098,7 +1309,7 @@ int redirect(Cmd *c)   //apply all redirections of one command
     for(i=0;i<c->nredir;i++)        //in typed order, like bash: "> a > b" creates a, output goes to b
     {                               //start of redirection loop
         r=&c->redir[i];             //this redirection
-        if(expand_path("myshell",r->file,real)!=0)return -1;   //handle "~"
+        if(expand_path("myshell",r->file,real)!=0)return -1;   //handle "~", jail check
         if(r->type==T_IN)flags=O_RDONLY;   //'<' reads the file
         else flags=O_WRONLY|O_CREAT|(r->type==T_APPEND?O_APPEND:O_TRUNC);  //'>' empties it, '>>' adds to the end
         fd=open(real,flags,0644);   //system call: open (new files get mode 644)
@@ -1116,7 +1327,8 @@ int redirect(Cmd *c)   //apply all redirections of one command
 void child_run(Cmd *c)   //runs in the forked child, never returns
 {                                   //start of child_run
     Command *b=find_command(c->argv[0]);   //is it one of our commands?
-    int r;                          //its exit status
+    int r,i;                        //its exit status, argument counter
+    char real[PATH_MAX];            //result of the argument check, not used afterwards
     if(redirect(c)!=0)_exit(1);     //set up < > >>; on error the child ends with 1
     if(b!=NULL)                     //our own command (ls, cp, help in a pipe, ...)
     {                               //start of own-command case
@@ -1124,6 +1336,13 @@ void child_run(Cmd *c)   //runs in the forked child, never returns
         fflush(stdout);             //write its output before leaving
         _exit(r);                   //end the child with its status
     }                               //end of own-command case
+    for(i=0;i<c->argc;i++)          //external program: check every argument first
+        if((i>0||strchr(c->argv[0],'/')!=NULL)&&expand_path(c->argv[0],c->argv[i],real)!=0)_exit(1);   //argv[0] counts only if it is a path; refused: the child ends with 1
+    if(jail_program()!=0)           //start the sandbox before the program runs
+    {                               //start of error case
+        perror("myshell: landlock");   //report it
+        _exit(126);                 //never run a program without its sandbox
+    }                               //end of error case
     execvp(c->argv[0],c->argv);     //system call: replace this child with the program (searches PATH)
     if(errno==ENOENT)fprintf(stderr,"%s: command not found\n",c->argv[0]);     //only reached if execvp failed
     else fprintf(stderr,"%s: %s\n",c->argv[0],strerror(errno));   //e.g. Permission denied
@@ -1277,6 +1496,7 @@ void on_sigint(int sig)             //runs when Ctrl+C reaches the shell
 int main(void)                      //program start
 {                                   //start of main
     char line[MAX_LINE];            //one input line
+    static char tmpdir[PATH_MAX+8]; //static: putenv() keeps this memory, it must stay valid
     Token tok[MAX_TOKENS];          //tokens of the line
     Cmd cmd[MAX_CMDS];              //commands of the pipeline
     int ntok,ncmd,bg,ch,color=0,interactive=isatty(STDIN_FILENO);     //counts, background flag, colour on?, is stdin a terminal?
@@ -1288,6 +1508,8 @@ int main(void)                      //program start
     }                               //end of error case
     strcpy(start_dir,prevdir);      //remember the start folder for pwd and the prompt
     start_len=strcmp(start_dir,"/")==0?0:strlen(start_dir);   //started in "/": show full paths
+    snprintf(tmpdir,sizeof(tmpdir),"TMPDIR=%s",start_dir);   //programs cannot reach /tmp, so give them the start folder
+    putenv(tmpdir);                 //put TMPDIR in the environment for every child
     memset(&sa,0,sizeof(sa));       //clear the sigaction settings
     sa.sa_handler=on_sigint;        //Ctrl+C does not kill the shell, only the running command
     sigaction(SIGINT,&sa,NULL);     //system call: install the handler
@@ -1299,6 +1521,7 @@ int main(void)                      //program start
         printf("%s+------------------------------------------------------------+%s\n",color?C_CYAN:"",color?C_RESET:"");  //banner bottom line
         printf("Type %shelp%s for commands, %shelp <cmd>%s for details, %sexit%s to quit.\n\n",   //how to get started
                color?C_BOLD:"",color?C_RESET:"",color?C_BOLD:"",color?C_RESET:"",color?C_BOLD:"",color?C_RESET:"");  //bold keywords
+        if(landlock_version()<1)printf("Note: no Landlock in this kernel; external programs are only checked by their arguments.\n\n");   //warn if the kernel sandbox is missing
     }                               //end of terminal setup
     while(1)                        //the read-execute loop, until exit or Ctrl+D
     {                               //start of main loop
