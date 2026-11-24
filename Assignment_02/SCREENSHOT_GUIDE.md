@@ -31,13 +31,13 @@ Update Field.
 |---|---|---|---|
 | 1 | 4.1 | `gcc -Wall -Wextra -O2 scheduling.c -o scheduling` | The gcc command with no warnings/errors |
 | 2 | 4.2 | `./scheduling` → e.g. `5` | “How many processes do you want?”, your answer, “input.txt created …” and the menu |
-| 3 | 4.3 | `7` | The full `input.txt`: sections `[FCFS] [SJF] [SRTN] [RR] [LOTTERY] [COMPARE]` with different random values; no RR quantum in the file |
+| 3 | 4.3 | `7` | The full `input.txt`: sections `[FCFS] [SJF] [SRTN] [RR] [LOTTERY] [COMPARE] [PRIORITY] [SJF_AGING]` with different random values; no RR quantum in the file |
 | 4 | 6.1 | Enter → `1` | FCFS: input table read from `[FCFS]`, Gantt chart with IDLE block(s), result table, averages, `CPU Utilisation = … % (busy … ms + idle … ms = … ms)` below 100 %, throughput |
 | 5 | 6.2 | Enter → `2` | SJF: input from `[SJF]`, Gantt chart with IDLE block(s), result table, averages |
 | 6 | 6.3 | Enter → `3` | SRTN: Gantt chart, result table, averages and `Preemptions = …` |
 | 7 | 6.4 | Enter → `4` → e.g. `3` | RR: input from `[RR]`, the prompt “Enter the time quantum q” with your value, Gantt chart, table, averages, process switches |
-| 8 | 6.5 | Enter → `5` | Lottery: arrival/burst/tickets, q and seed read from the file, ticket shares, the execution log `t=… pool=… draw=… -> P… runs …` (with “CPU idle until …” lines), table with tickets |
-| 9 | 6.6 | Enter → `6` → e.g. `2` | Comparison: input from `[COMPARE]`, the five Gantt charts, the INTEGRATED COMPARISON table and the three “Best average …” lines |
+| 8 | 6.5 | Enter → `5` | Lottery: arrival/burst/tickets, q and seed read from the file, ticket shares, the execution log `t=… pool=… draw=… -> P… runs … [tickets/pool = chance]` (with “CPU idle until …” lines), table with tickets |
+| 9 | 6.6 | Enter → `6` → e.g. `2` | Comparison: input from `[COMPARE]`, the seven Gantt charts, the INTEGRATED COMPARISON table and the three “Best average …” lines |
 | 10 | 7 (Q2) | Enter → `6` → `100` | Comparison with RR q = 100 (larger than every burst): the RR row and Gantt chart are identical to FCFS |
 | 11 | 4.4 | Enter → `0`, then `ls input.txt` | “input.txt has been flushed and deleted.” and `ls: cannot access 'input.txt'` |
 | 12 | 4.4 | `./scheduling` → a different number, e.g. `4` → `7` | A new run: new process count and a new `input.txt` with different random values |
@@ -51,4 +51,6 @@ taken as two screenshots (top and bottom).
 |---|---|
 | Ctrl+C cleanup | Start `./scheduling`, enter a number, press **Ctrl+C**, then `ls input.txt` → “Interrupted - input.txt flushed and deleted.” and the file is gone |
 | Wrong input | At any prompt type `abc` or `99` → “Please enter a whole number between …” and the question is asked again |
-| Worked examples (section 5) | While the menu is open, replace a section of `input.txt` in another terminal with a lab-sheet example (see Appendix A of the report), then choose that option — the program re-reads the file every time |
+| Worked examples (section 5) | While the menu is open, replace a section of `input.txt` in another terminal with a lab-sheet example (see Appendix A of the report), then choose that option — the program re-reads the file every time. Keep one row/parameter per line; `[COMPARE]` rows are now `arrival burst tickets priority`, followed by lottery q, seed and alpha |
+| Existing `input.txt` | Put any `input.txt` in the folder, start `./scheduling` → choose `1` (kept as `input.txt.bak1`) or `0` (quit, file untouched) |
+| Priority / SJF Aging | Menu options `8` and `9` |
